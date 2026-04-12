@@ -1,0 +1,18 @@
+---
+BasedOnStyle:                  LLVM
+IndentWidth:                   2
+ColumnLimit:                   80
+AccessModifierOffset:          -2
+AlignConsecutiveAssignments:   Consecutive
+AlignConsecutiveDeclarations:  Consecutive
+AlignTrailingComments:
+  Kind:                        Always
+  OverEmptyLines:              1
+AllowShortFunctionsOnASingleLine: Inline
+BraceWrapping:
+  AfterFunction:               true
+BreakBeforeBraces:             Allman
+IncludeBlocks:                 Regroup
+PointerAlignment:              Left
+SortIncludes:                  CaseSensitive
+SpaceBeforeParens:             ControlStatements
