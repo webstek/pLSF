@@ -1,7 +1,7 @@
-# Makefile for gLSF – GPU Lower-Star Filtration
+# Makefile for pLSF – Parallelized Lower-Star Filtration
 # ─────────────────────────────────────────────────────────────────────────────
 # Build system: AdaptiveCpp (hip SYCL)
-# Compiler: syclcc (AdaptiveCpp wrapper around clang++)
+# Compiler: acpp (AdaptiveCpp C++ compiler)
 #
 # Usage:
 #   make                  # build all targets
@@ -12,7 +12,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-CXX                 := syclcc
+CXX                 := acpp
 CXXFLAGS            := -std=c++17 -Wall -Wextra
 INCLUDE_DIRS        := -I./src
 LDFLAGS             :=
@@ -29,13 +29,14 @@ else
     CXXFLAGS        += $(RELEASE_FLAGS)
 endif
 
-# Targets (optional; AdaptiveCpp will auto-detect or use "native")
+# Targets (optional; AdaptiveCpp will auto-detect or use "generic")
 # For specific hardware, add: --hipsycl-targets=...
 # Examples:
-#   --hipsycl-targets=native                    # CPU
-#   --hipsycl-targets=cuda:gfx906               # AMD GPU (CDNA)
+#   --hipsycl-targets=generic                   # CPU (auto-detect)
+#   --hipsycl-targets=cuda                      # NVIDIA GPU
+#   --hipsycl-targets=hip                       # AMD GPU
 #   --hipsycl-targets=omp                       # OpenMP
-SYCL_TARGETS        ?= native
+SYCL_TARGETS        ?= generic
 
 # ── File organization ─────────────────────────────────────────────────────────
 SRC_DIR             := src
@@ -43,17 +44,16 @@ BUILD_DIR           := build
 BIN_DIR             := bin
 
 # Source files
+# io.cpp and lsf.cpp are header-only template stubs; only main.cpp is compiled
 MAIN_SRC            := $(SRC_DIR)/main.cpp
-IO_SRC              := $(SRC_DIR)/io/volume_io.cpp
-FILTRATION_SRC      := $(SRC_DIR)/filtration/lower_star.cpp
 
-SOURCES             := $(MAIN_SRC) $(IO_SRC) $(FILTRATION_SRC)
+SOURCES             := $(MAIN_SRC)
 
 # Object files
 OBJECTS             := $(patsubst $(SRC_DIR)/%.cpp, $(BUILD_DIR)/%.o, $(SOURCES))
 
 # Output binary
-EXECUTABLE          := $(BIN_DIR)/glsf
+EXECUTABLE          := $(BIN_DIR)/plsf
 
 # ── Targets ────────────────────────────────────────────────────────────────────
 .PHONY: all release debug clean run info
@@ -95,7 +95,7 @@ run: $(EXECUTABLE)
 
 # Show configuration
 info:
-	@echo "gLSF Build Configuration"
+	@echo "pLSF Build Configuration"
 	@echo "========================"
 	@echo "Compiler          : $(CXX)"
 	@echo "C++ Standard      : C++17"
@@ -106,12 +106,10 @@ info:
 	@echo ""
 	@echo "Source Files:"
 	@echo "  Main     : $(MAIN_SRC)"
-	@echo "  I/O      : $(IO_SRC)"
-	@echo "  Filtration : $(FILTRATION_SRC)"
 
 # Show help
 help:
-	@echo "gLSF Makefile Targets"
+	@echo "pLSF Makefile Targets"
 	@echo "====================="
 	@echo ""
 	@echo "make [release]      Build optimized binary (default)"
@@ -123,9 +121,7 @@ help:
 	@echo ""
 	@echo "Environment Variables:"
 	@echo "  BUILD_MODE=debug    Compile with -g -O0"
-	@echo "  SYCL_TARGETS=...    AdaptiveCpp backend: native|omp|cuda:...|hip:..."
-	@echo ""
-	@echo "Examples:"
+@echo "  SYCL_TARGETS=...    AdaptiveCpp backend: generic|omp|cuda|hip"
 	@echo "  make                         # Release build, auto-detect GPU"
 	@echo "  make debug                   # Debug build"
 	@echo "  make SYCL_TARGETS=omp        # CPU via OpenMP"

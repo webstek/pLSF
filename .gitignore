@@ -1,2 +1,7 @@
-.exe
-.o
+*.exe
+*.o
+*.out
+.clang-format
+.vscode
+build
+bin
