@@ -33,7 +33,9 @@ struct Config
   std::string device_hint = "gpu"; ///< "cpu" | "gpu" | "default"
   bool        verbose = false;
   bool        timings = false;
-  bool        pairs   = false; ///< compute persistence pairs via phat
+  bool        pairs = false; ///< compute persistence pairs via phat
+  bool filtration_only
+      = false; ///< stop after filtration; do not compute boundary matrix
 };
 
 static void print_usage (const char *prog)
@@ -49,6 +51,8 @@ static void print_usage (const char *prog)
                "  -p, --pairs           Compute persistence pairs via phat\n"
                "                        (default: output boundary matrix "
                "only)\n"
+               "  -f, --filtration-only Stop after filtration is computed\n"
+               "                        (skip boundary matrix and output)\n"
                "  -t, --timings         Report per-step wall time and memory "
                "usage  [off]\n"
                "  -v, --verbose         Print device info and grid statistics  "
@@ -89,6 +93,8 @@ static Config parse_args (int argc, char *argv[])
         cfg.timings = true;
       else if (a == "-p" || a == "--pairs")
         cfg.pairs = true;
+      else if (a == "-f" || a == "--filtration-only")
+        cfg.filtration_only = true;
       else if ((a == "-d" || a == "--device") && i + 1 < argc)
         cfg.device_hint = argv[++i];
       else if ((a == "-o" || a == "--output") && i + 1 < argc)
@@ -105,6 +111,18 @@ static Config parse_args (int argc, char *argv[])
   if (cfg.input_path.empty ())
     {
       std::cerr << "Error: no input file specified.\n";
+      std::exit (1);
+    }
+  if (cfg.filtration_only && cfg.pairs)
+    {
+      std::cerr
+          << "Error: --pairs cannot be used with --filtration-only.\n";
+      std::exit (1);
+    }
+  if (cfg.filtration_only && !cfg.output_stem.empty ())
+    {
+      std::cerr
+          << "Error: --output cannot be used with --filtration-only.\n";
       std::exit (1);
     }
   return cfg;
@@ -257,36 +275,25 @@ int main (int argc, char *argv[])
             cur_host_rss_kb (), dev_kb });
       }
 
-      // Boundary matrix computation + output
-      if (!cfg.output_stem.empty ())
+      if (cfg.filtration_only)
         {
-          // Analytical peak device memory across both passes:
-          //   Pass 1: d_ordering(8) + d_inv(8) + d_dims(1)      = 17*n_cells
-          //   bytes Pass 2: d_ordering(8) + d_inv(8) + d_offsets(8)   =
-          //   24*n_cells + 8 bytes
-          //           + d_boundaries(4*total_bnd)
-          //   total_bnd = 2*n_edges + 4*n_faces + 6*n_cubes
-          const uint64_t n_edges
-              = (Nx - 1) * Ny * Nz + Nx * (Ny - 1) * Nz + Nx * Ny * (Nz - 1);
-          const uint64_t n_faces = (Nx - 1) * (Ny - 1) * Nz
-                                   + (Nx - 1) * Ny * (Nz - 1)
-                                   + Nx * (Ny - 1) * (Nz - 1);
-          const uint64_t n_cubes = (Nx - 1) * (Ny - 1) * (Nz - 1);
-          const uint64_t total_bnd = 2 * n_edges + 4 * n_faces + 6 * n_cubes;
-          const uint64_t pass1_bytes = 17 * n_cells;
-          const uint64_t pass2_bytes = 24 * n_cells + 8 + 4 * total_bnd;
-          const long     bm_dev_kb
-              = static_cast<long> (std::max (pass1_bytes, pass2_bytes) / 1024);
+          if (cfg.verbose)
+            std::cout
+                << "Filtration computed; exiting due to --filtration-only.\n";
+        }
 
+      // Boundary matrix computation + output
+      if (!cfg.filtration_only && !cfg.output_stem.empty ())
+        {
           if (cfg.verbose)
             std::cout << "Computing boundary matrix...\n";
 
+          // No device memory used — inv_ordering (4 bytes/cell) is the only
+          // intermediate host allocation beyond the phat representation.
           t0 = Clock::now ();
-          auto result
-              = plsf::compute_boundary_matrix (filtration, queue);
-          rows.push_back ({ "Boundary matrix",
-              Ms (Clock::now () - t0).count (), cur_host_rss_kb (),
-              bm_dev_kb });
+          auto result = plsf::compute_boundary_matrix (filtration);
+          rows.push_back ({ "Boundary matrix", Ms (Clock::now () - t0).count (),
+              cur_host_rss_kb (), -1 });
 
           if (cfg.pairs)
             {
@@ -303,8 +310,8 @@ int main (int argc, char *argv[])
               pairs.save_binary (cfg.output_stem + ".pairs");
               plsf::write_filtration_values (
                   result.filt_values, cfg.output_stem);
-              rows.push_back ({ "File I/O",
-                  Ms (Clock::now () - t0).count (), cur_host_rss_kb (), -1 });
+              rows.push_back ({ "File I/O", Ms (Clock::now () - t0).count (),
+                  cur_host_rss_kb (), -1 });
 
               if (cfg.verbose)
                 std::cout << "Written : " << cfg.output_stem << ".pairs  "
@@ -316,8 +323,8 @@ int main (int argc, char *argv[])
               result.matrix.save_binary (cfg.output_stem + ".bin");
               plsf::write_filtration_values (
                   result.filt_values, cfg.output_stem);
-              rows.push_back ({ "File I/O",
-                  Ms (Clock::now () - t0).count (), cur_host_rss_kb (), -1 });
+              rows.push_back ({ "File I/O", Ms (Clock::now () - t0).count (),
+                  cur_host_rss_kb (), -1 });
 
               if (cfg.verbose)
                 std::cout << "Written : " << cfg.output_stem << ".bin  "
