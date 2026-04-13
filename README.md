@@ -10,10 +10,11 @@ pairs via PHAT's twist reduction algorithm.
 
 ## Build
 
-**Requirements:** [AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp) (`acpp` in `PATH`), `make`, C++17
+**Requirements:** NVIDIA CUDA Toolkit (for `nvcc`), `make`, C++17 toolchain (`g++`)
 
 The [PHAT](https://github.com/blazs/phat) library is included as a Git
-submodule.  After cloning, initialise it with:
+submodule at `lib/phat` (headers under `lib/phat/include`). After cloning,
+initialise it with:
 
 ```bash
 git submodule update --init --recursive
@@ -27,22 +28,16 @@ make debug    # with debug symbols
 make clean
 ```
 
-Target a specific backend with `SYCL_TARGETS` (`generic` by default):
-
-| Backend | Flag |
-|---|---|
-| CPU (OpenMP) | `omp` |
-| NVIDIA GPU | `cuda` |
-| AMD GPU | `hip` |
+Target a specific GPU architecture when needed:
 
 ```bash
-make SYCL_TARGETS=cuda
-make SYCL_TARGETS=omp BUILD_MODE=debug
+make CUDA_ARCH=sm_80
 ```
 
 **Troubleshooting:**
-- **`acpp` not found**: ensure AdaptiveCpp is installed and in `PATH`
-- **CUDA/HIP failures**: verify CUDA Toolkit or ROCm is installed
+- **`nvcc` not found**: ensure CUDA Toolkit is installed and `nvcc` is in `PATH`
+- **Submodule issues**: run `git submodule sync --recursive && git submodule update --init --recursive`
+- **CUDA build failures**: verify driver/toolkit compatibility for your GPU
 
 ## Usage
 
@@ -50,7 +45,7 @@ make SYCL_TARGETS=omp BUILD_MODE=debug
 ./bin/plsf [options] <input.nii>
 
 Options:
-  -d, --device  <mode>  SYCL device selector: cpu|gpu|default  [gpu]
+  -d, --device  <mode>  CUDA device selector: gpu|default  [gpu]
   -o, --output  <stem>  Write output files with the given stem
   -p, --pairs           Compute persistence pairs via phat
                         (default: output boundary matrix only)

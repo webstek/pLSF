@@ -1,7 +1,7 @@
 # Makefile for pLSF – Parallelized Lower-Star Filtration
 # ─────────────────────────────────────────────────────────────────────────────
-# Build system: AdaptiveCpp (hip SYCL)
-# Compiler: acpp (AdaptiveCpp C++ compiler)
+# Build system: CUDA + host C++
+# Compilers: nvcc (CUDA), g++ (host C++)
 #
 # Usage:
 #   make                  # build all targets
@@ -12,51 +12,58 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-CXX                 := acpp
+NVCC                := nvcc
+CXX                 := g++
 CXXFLAGS            := -std=c++17 -Wall -Wextra
+NVCCFLAGS           := -std=c++17
 INCLUDE_DIRS        := -I./src -I./lib/phat/include
 LDFLAGS             :=
 
 # Build modes
-DEBUG_FLAGS         := -g -O0 -fno-omit-frame-pointer
+DEBUG_FLAGS         := -g -O0
+DEBUG_NVFLAGS       := -G -g -O0
 RELEASE_FLAGS       := -O3 -DNDEBUG
+RELEASE_NVFLAGS     := -O3 -DNDEBUG
 
 # Default: Release
 BUILD_MODE          ?= release
 ifeq ($(BUILD_MODE), debug)
     CXXFLAGS        += $(DEBUG_FLAGS)
+    NVCCFLAGS       += $(DEBUG_NVFLAGS)
 else
     CXXFLAGS        += $(RELEASE_FLAGS)
+    NVCCFLAGS       += $(RELEASE_NVFLAGS)
 endif
 
-# Targets (optional; AdaptiveCpp will auto-detect or use "generic")
-# For specific hardware, add: --hipsycl-targets=...
-# Examples:
-#   --hipsycl-targets=generic                   # CPU (auto-detect)
-#   --hipsycl-targets=cuda                      # NVIDIA GPU
-#   --hipsycl-targets=hip                       # AMD GPU
-#   --hipsycl-targets=omp                       # OpenMP
-SYCL_TARGETS        ?= generic
+# CUDA architecture (default: generate for common architectures)
+# Override with: make CUDA_ARCH="sm_80"
+CUDA_ARCH           ?= native
+NVCCFLAGS           += -arch=$(CUDA_ARCH)
+
+# OpenMP for boundary matrix computation
+CXXFLAGS            += -fopenmp
+LDFLAGS             += -Xcompiler -fopenmp
 
 # ── File organization ─────────────────────────────────────────────────────────
 SRC_DIR             := src
+CUDA_DIR            := src/cuda
 BUILD_DIR           := build
 BIN_DIR             := bin
 
 # Source files
-# io.cpp and lsf.cpp are header-only template stubs; only main.cpp is compiled
 MAIN_SRC            := $(SRC_DIR)/main.cpp
-
-SOURCES             := $(MAIN_SRC)
+CUDA_SRCS           := $(wildcard $(CUDA_DIR)/*.cu)
 
 # Object files
-OBJECTS             := $(patsubst $(SRC_DIR)/%.cpp, $(BUILD_DIR)/%.o, $(SOURCES))
+MAIN_OBJ            := $(BUILD_DIR)/main.o
+CUDA_OBJS           := $(patsubst $(CUDA_DIR)/%.cu, $(BUILD_DIR)/cuda/%.o, $(CUDA_SRCS))
+OBJECTS             := $(MAIN_OBJ) $(CUDA_OBJS)
 
 # Output binary
 EXECUTABLE          := $(BIN_DIR)/plsf
 
 # ── Targets ────────────────────────────────────────────────────────────────────
-.PHONY: all release debug clean run info
+.PHONY: all release debug clean run info help
 
 # Default target
 all: $(EXECUTABLE)
@@ -68,16 +75,21 @@ release: all
 debug: BUILD_MODE := debug
 debug: all
 
-# Build executable
+# Link: use nvcc to link CUDA objects with host objects
 $(EXECUTABLE): $(OBJECTS) | $(BIN_DIR)
 	@echo "[LD] $@"
-	@$(CXX) $(CXXFLAGS) --hipsycl-targets=$(SYCL_TARGETS) $(OBJECTS) $(LDFLAGS) -o $@
+	@$(NVCC) $(NVCCFLAGS) $(OBJECTS) $(LDFLAGS) -o $@
 
-# Compile source files
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
+# Compile main.cpp (host code) — use nvcc to handle CUDA includes
+$(BUILD_DIR)/main.o: $(SRC_DIR)/main.cpp | $(BUILD_DIR)
+	@echo "[NVCC] $<"
+	@$(NVCC) $(NVCCFLAGS) $(INCLUDE_DIRS) -Xcompiler "$(CXXFLAGS)" -c $< -o $@
+
+# Compile CUDA kernel files
+$(BUILD_DIR)/cuda/%.o: $(CUDA_DIR)/%.cu | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	@echo "[CXX] $<"
-	@$(CXX) $(CXXFLAGS) $(INCLUDE_DIRS) --hipsycl-targets=$(SYCL_TARGETS) -c $< -o $@
+	@echo "[NVCC] $<"
+	@$(NVCC) $(NVCCFLAGS) $(INCLUDE_DIRS) -c $< -o $@
 
 # Create directories
 $(BUILD_DIR) $(BIN_DIR):
@@ -97,15 +109,17 @@ run: $(EXECUTABLE)
 info:
 	@echo "pLSF Build Configuration"
 	@echo "========================"
-	@echo "Compiler          : $(CXX)"
+	@echo "NVCC              : $(NVCC)"
+	@echo "Host CXX          : $(CXX)"
 	@echo "C++ Standard      : C++17"
 	@echo "Build Mode        : $(BUILD_MODE)"
-	@echo "SYCL Targets      : $(SYCL_TARGETS)"
+	@echo "CUDA Architecture : $(CUDA_ARCH)"
 	@echo "Build Directory   : $(BUILD_DIR)"
 	@echo "Binary            : $(EXECUTABLE)"
 	@echo ""
 	@echo "Source Files:"
 	@echo "  Main     : $(MAIN_SRC)"
+	@echo "  CUDA     : $(CUDA_SRCS)"
 
 # Show help
 help:
@@ -119,10 +133,13 @@ help:
 	@echo "make info           Show build configuration"
 	@echo "make help           Show this message"
 	@echo ""
+	@echo "Variables:"
+	@echo "  CUDA_ARCH=sm_80   Target a specific GPU architecture"
+	@echo ""
 	@echo "Environment Variables:"
 	@echo "  BUILD_MODE=debug    Compile with -g -O0"
-@echo "  SYCL_TARGETS=...    AdaptiveCpp backend: generic|omp|cuda|hip"
-	@echo "  make                         # Release build, auto-detect GPU"
+	@echo "  CUDA_ARCH=sm_80     Target a specific NVIDIA architecture"
+	@echo "  make                         # Release build"
 	@echo "  make debug                   # Debug build"
-	@echo "  make SYCL_TARGETS=omp        # CPU via OpenMP"
+	@echo "  make CUDA_ARCH=sm_90         # Build for Hopper"
 	@echo "  make clean && make release   # Clean rebuild"

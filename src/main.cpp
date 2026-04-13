@@ -10,8 +10,8 @@
 #include "boundary.hpp"
 #include "grid.hpp"
 #include "io.hpp"
-#include "lsf.hpp"
-#include "sycl_utils.hpp"
+#include "cuda/lsf.hpp"
+#include "cuda/cuda_utils.cuh"
 
 #include <phat/compute_persistence_pairs.h>
 #include <phat/persistence_pairs.h>
@@ -30,7 +30,7 @@ struct Config
 {
   std::string input_path;
   std::string output_stem; ///< stem for .bin/.vals output; empty = no output
-  std::string device_hint = "gpu"; ///< "cpu" | "gpu" | "default"
+  std::string device_hint = "gpu"; ///< "gpu" | "default"
   bool        verbose = false;
   bool        timings = false;
   bool        pairs = false; ///< compute persistence pairs via phat
@@ -44,7 +44,7 @@ static void print_usage (const char *prog)
             << " [options] <input.nii>\n"
                "\n"
                "Options:\n"
-               "  -d, --device  <mode>  SYCL device selector: cpu|gpu|default  "
+               "  -d, --device  <mode>  CUDA device selector: gpu|default  "
                "[gpu]\n"
                "  -o, --output  <stem>  Write output files with the given "
                "stem\n"
@@ -216,16 +216,16 @@ int main (int argc, char *argv[])
 {
   const Config cfg = parse_args (argc, argv);
 
-  // Select SYCL device
+  // Select CUDA device
   plsf::DevicePreference dev_pref = plsf::DevicePreference::GPU;
   if (cfg.device_hint == "cpu")
     dev_pref = plsf::DevicePreference::CPU;
   else if (cfg.device_hint == "default")
     dev_pref = plsf::DevicePreference::Default;
 
-  sycl::queue queue = plsf::make_queue (dev_pref);
+  int cuda_dev = plsf::select_device (dev_pref);
   if (cfg.verbose)
-    plsf::print_device_info (queue);
+    plsf::print_device_info (cuda_dev);
 
   std::vector<TimingRow> rows;
 
@@ -256,7 +256,7 @@ int main (int argc, char *argv[])
 
       // Complex computation
       t0 = Clock::now ();
-      filtration.compute_complex (queue);
+      filtration.compute_complex ();
       {
         // Peak device: d_grid and d_cube_map live simultaneously
         const long dev_kb
@@ -267,10 +267,11 @@ int main (int argc, char *argv[])
 
       // Complex sorting
       t0 = Clock::now ();
-      filtration.compute_ordering (queue);
+      filtration.compute_ordering ();
       {
-        // Peak device: d_dims only
-        const long dev_kb = static_cast<long> (n_cells * sizeof (int) / 1024);
+        // Peak device: d_cube_map + d_ordering + d_keys (+ thrust temp)
+        const long dev_kb = static_cast<long> (
+          n_cells * (sizeof (float) + 2 * sizeof (uint32_t)) / 1024);
         rows.push_back ({ "Complex sorting", Ms (Clock::now () - t0).count (),
             cur_host_rss_kb (), dev_kb });
       }
@@ -331,11 +332,6 @@ int main (int argc, char *argv[])
                           << cfg.output_stem << ".vals\n";
             }
         }
-    }
-  catch (const sycl::exception &e)
-    {
-      std::cerr << "SYCL error: " << e.what () << '\n';
-      return 1;
     }
   catch (const std::exception &e)
     {

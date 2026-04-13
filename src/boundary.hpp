@@ -16,9 +16,8 @@
 /// are computed on-the-fly from the doubled-coordinate representation,
 /// avoiding separate dims, offsets, and boundary arrays.
 ///
-/// phat's data structures are CPU-based (std::vector) so SYCL device
-/// kernels cannot populate columns directly.  OpenMP is used instead,
-/// consistent with phat's own parallel initialisation path.
+/// phat's data structures are CPU-based (std::vector), so columns are
+/// populated on the host with OpenMP parallelism.
 // ****************************************************************************
 #include <algorithm>
 #include <cstdint>
@@ -29,7 +28,7 @@
 #include <phat/boundary_matrix.h>
 #include <phat/representations/bit_tree_pivot_column.h>
 
-#include "lsf.hpp"
+#include "cuda/lsf.hpp"
 
 namespace plsf
 {
@@ -91,7 +90,7 @@ BoundaryResult compute_boundary_matrix (LowerStarFiltration<scalar> const &lsf)
   result.matrix.set_num_cols (static_cast<phat::index> (num_cells));
   result.filt_values.resize (num_cells);
 
-  const uint64_t *ordering = lsf.ordering.data ();
+  const uint32_t *ordering = lsf.ordering.data ();
   const scalar   *cube_map = lsf.cc.cube_map.data ();
   const uint32_t *inv_ptr = inv.data ();
   double         *fv = result.filt_values.data ();
@@ -99,7 +98,7 @@ BoundaryResult compute_boundary_matrix (LowerStarFiltration<scalar> const &lsf)
 #pragma omp parallel for schedule(dynamic, 4096)
   for (int64_t p = 0; p < static_cast<int64_t> (num_cells); ++p)
     {
-      const uint64_t idx = ordering[p];
+      const uint64_t idx = static_cast<uint64_t> (ordering[p]);
       const uint64_t ci = idx % Mx;
       const uint64_t cj = (idx / Mx) % My;
       const uint64_t ck = idx / MxMy;

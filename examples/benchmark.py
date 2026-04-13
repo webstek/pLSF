@@ -167,8 +167,8 @@ def main() -> None:
     parser.add_argument(
         "--device",
         default="gpu",
-        choices=["cpu", "gpu", "default"],
-        help="SYCL device for plsf (default: gpu).",
+        choices=["gpu", "default"],
+        help="CUDA device selector for plsf (default: gpu).",
     )
     parser.add_argument(
         "--skip-plsf", action="store_true", help="Skip the pLSF+PHAT pipeline."
