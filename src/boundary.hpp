@@ -6,7 +6,8 @@
 /// @date 12 Apr 2026
 /// @brief PHAT boundary matrix computation from a lower-star filtration
 /// @details
-/// Computes the boundary matrix of a completed LowerStarFiltration using two
+/// Computes the boundary matrix of a completed LowerStarFiltration directly
+/// into a phat::boundary_matrix<phat::bit_tree_pivot_column>, using two
 /// SYCL-accelerated passes:
 ///
 ///   Pass 1 – build the inverse index map and cell dimensions in one kernel:
@@ -17,10 +18,10 @@
 ///              face global CubeMap indices and look up their filtration
 ///              position through inv_ordering; write results to boundaries[].
 ///
-/// The resulting BoundaryMatrix can be serialised to PHAT binary format via
-/// write_phat_binary().  A companion .vals file stores one double per cell
-/// giving the filtration value, allowing PHAT's column-index output pairs to
-/// be mapped back to birth/death times.
+/// The resulting boundary matrix is stored in phat's bit_tree_pivot_column
+/// representation, ready for persistence pair computation via phat's
+/// reduction algorithms.  A companion filtration-values vector stores one
+/// double per cell, mapping column indices to birth/death values.
 // ****************************************************************************
 #include <algorithm>
 #include <cstdint>
@@ -29,25 +30,20 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#include <phat/boundary_matrix.h>
+#include <phat/representations/bit_tree_pivot_column.h>
+
 #include "lsf.hpp"
 
 namespace plsf
 {
 
 // ****************************************************************************
-/// @brief Boundary matrix in PHAT column format
-/// @tparam scalar filtration value type
-/// @details
-/// dims uses uint8_t (values 0-3) and boundaries uses uint32_t (filtration
-/// positions fit in 32 bits for grids up to ~4 billion cells). Offsets are
-/// not stored; they are recomputed from dims at serialisation time.
-/// This gives ~12 bytes/cell versus the naive ~48 bytes/cell with int64_t.
-template <typename scalar> struct BoundaryMatrix
+/// @brief Result of boundary matrix computation
+struct BoundaryResult
 {
-  uint64_t num_cells; ///< total cells (== ordering.size())
-  std::vector<uint8_t>
-      dims; ///< cell dimension per filtration position (values 0-3)
-  std::vector<uint32_t> boundaries; ///< flat sorted boundary filtration indices
+  phat::boundary_matrix<phat::bit_tree_pivot_column>
+      matrix; ///< boundary matrix in bit_tree_pivot_column representation
   std::vector<double> filt_values; ///< filtration value per filtration position
 };
 // ****************************************************************************
@@ -59,9 +55,9 @@ template <typename scalar> struct BoundaryMatrix
 /// @param lsf  completed lower-star filtration (cc and ordering must be
 /// populated)
 /// @param q    SYCL queue for GPU-accelerated passes
-/// @return     BoundaryMatrix ready for serialisation
+/// @return     BoundaryResult with phat boundary matrix and filtration values
 template <typename scalar>
-BoundaryMatrix<scalar> compute_boundary_matrix (
+BoundaryResult compute_boundary_matrix (
     LowerStarFiltration<scalar> const &lsf, sycl::queue &q)
 {
   const uint64_t Nx = lsf.cc.Nx;
@@ -169,20 +165,10 @@ BoundaryMatrix<scalar> compute_boundary_matrix (
      });
    }).wait ();
 
-  // PHAT requires boundary indices sorted in ascending order per column.
-  // Slices have max size 6 so std::sort on small ranges is trivial.
   std::vector<uint32_t> boundaries (bnd_alloc);
   q.memcpy (boundaries.data (), d_boundaries, bnd_alloc * sizeof (uint32_t))
       .wait ();
   boundaries.resize (static_cast<std::size_t> (total_bnd));
-
-  for (uint64_t p = 0; p < num_cells; ++p)
-    std::sort (boundaries.begin () + static_cast<std::ptrdiff_t> (offsets[p]),
-        boundaries.begin () + static_cast<std::ptrdiff_t> (offsets[p + 1]));
-
-  std::vector<double> filt_values (num_cells);
-  for (uint64_t p = 0; p < num_cells; ++p)
-    filt_values[p] = static_cast<double> (lsf.cc.cube_map[lsf.ordering[p]]);
 
   sycl::free (d_ordering, q);
   sycl::free (d_inv, q);
@@ -190,12 +176,33 @@ BoundaryMatrix<scalar> compute_boundary_matrix (
   sycl::free (d_offsets, q);
   sycl::free (d_boundaries, q);
 
-  BoundaryMatrix<scalar> bm;
-  bm.num_cells = num_cells;
-  bm.dims = std::move (dims);
-  bm.boundaries = std::move (boundaries);
-  bm.filt_values = std::move (filt_values);
-  return bm;
+  // Populate phat boundary matrix with parallel column insertion.
+  // Each column has at most 6 boundary entries (cubes in 3D); PHAT requires
+  // them sorted in ascending order.
+  BoundaryResult result;
+  result.matrix.set_num_cols (static_cast<phat::index> (num_cells));
+
+#pragma omp parallel for schedule(dynamic, 1024)
+  for (int64_t p = 0; p < static_cast<int64_t> (num_cells); ++p)
+    {
+      result.matrix.set_dim (
+          static_cast<phat::index> (p), static_cast<phat::dimension> (dims[p]));
+
+      const uint64_t beg = offsets[p];
+      const uint64_t end = offsets[p + 1];
+      phat::column   col (end - beg);
+      for (uint64_t b = beg; b < end; ++b)
+        col[b - beg] = static_cast<phat::index> (boundaries[b]);
+      std::sort (col.begin (), col.end ());
+      result.matrix.set_col (static_cast<phat::index> (p), col);
+    }
+
+  result.filt_values.resize (num_cells);
+  for (uint64_t p = 0; p < num_cells; ++p)
+    result.filt_values[p]
+        = static_cast<double> (lsf.cc.cube_map[lsf.ordering[p]]);
+
+  return result;
 }
 // ****************************************************************************
 

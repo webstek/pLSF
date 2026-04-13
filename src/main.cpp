@@ -13,6 +13,9 @@
 #include "lsf.hpp"
 #include "sycl_utils.hpp"
 
+#include <phat/compute_persistence_pairs.h>
+#include <phat/persistence_pairs.h>
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -30,6 +33,7 @@ struct Config
   std::string device_hint = "gpu"; ///< "cpu" | "gpu" | "default"
   bool        verbose = false;
   bool        timings = false;
+  bool        pairs   = false; ///< compute persistence pairs via phat
 };
 
 static void print_usage (const char *prog)
@@ -40,14 +44,24 @@ static void print_usage (const char *prog)
                "Options:\n"
                "  -d, --device  <mode>  SYCL device selector: cpu|gpu|default  "
                "[gpu]\n"
-               "  -o, --output  <stem>  Write PHAT binary boundary matrix to\n"
-               "                        <stem>.bin and filtration values to "
-               "<stem>.vals\n"
+               "  -o, --output  <stem>  Write output files with the given "
+               "stem\n"
+               "  -p, --pairs           Compute persistence pairs via phat\n"
+               "                        (default: output boundary matrix "
+               "only)\n"
                "  -t, --timings         Report per-step wall time and memory "
                "usage  [off]\n"
                "  -v, --verbose         Print device info and grid statistics  "
                " [off]\n"
                "  -h, --help            Show this message and exit\n"
+               "\n"
+               "Output (requires -o):\n"
+               "  Without -p:  <stem>.bin   PHAT binary boundary matrix\n"
+               "               <stem>.vals  Filtration values (binary "
+               "doubles)\n"
+               "  With -p:     <stem>.pairs Persistence pairs (PHAT binary)\n"
+               "               <stem>.vals  Filtration values (binary "
+               "doubles)\n"
                "\n"
                "Supported formats: .nii (NIfTI-1/2, uncompressed)\n";
 }
@@ -73,6 +87,8 @@ static Config parse_args (int argc, char *argv[])
         cfg.verbose = true;
       else if (a == "-t" || a == "--timings")
         cfg.timings = true;
+      else if (a == "-p" || a == "--pairs")
+        cfg.pairs = true;
       else if ((a == "-d" || a == "--device") && i + 1 < argc)
         cfg.device_hint = argv[++i];
       else if ((a == "-o" || a == "--output") && i + 1 < argc)
@@ -241,7 +257,7 @@ int main (int argc, char *argv[])
             cur_host_rss_kb (), dev_kb });
       }
 
-      // Boundary matrix computation + file I/O
+      // Boundary matrix computation + output
       if (!cfg.output_stem.empty ())
         {
           // Analytical peak device memory across both passes:
@@ -266,18 +282,47 @@ int main (int argc, char *argv[])
             std::cout << "Computing boundary matrix...\n";
 
           t0 = Clock::now ();
-          const auto bm = plsf::compute_boundary_matrix (filtration, queue);
-          rows.push_back ({ "Boundary matrix", Ms (Clock::now () - t0).count (),
-              cur_host_rss_kb (), bm_dev_kb });
+          auto result
+              = plsf::compute_boundary_matrix (filtration, queue);
+          rows.push_back ({ "Boundary matrix",
+              Ms (Clock::now () - t0).count (), cur_host_rss_kb (),
+              bm_dev_kb });
 
-          t0 = Clock::now ();
-          plsf::write_phat_binary (bm, cfg.output_stem);
-          rows.push_back ({ "File I/O", Ms (Clock::now () - t0).count (),
-              cur_host_rss_kb (), -1 });
+          if (cfg.pairs)
+            {
+              if (cfg.verbose)
+                std::cout << "Computing persistence pairs...\n";
 
-          if (cfg.verbose)
-            std::cout << "Written : " << cfg.output_stem << ".bin  "
-                      << cfg.output_stem << ".vals\n";
+              t0 = Clock::now ();
+              phat::persistence_pairs pairs;
+              phat::compute_persistence_pairs (pairs, result.matrix);
+              rows.push_back ({ "Persistence pairs",
+                  Ms (Clock::now () - t0).count (), cur_host_rss_kb (), -1 });
+
+              t0 = Clock::now ();
+              pairs.save_binary (cfg.output_stem + ".pairs");
+              plsf::write_filtration_values (
+                  result.filt_values, cfg.output_stem);
+              rows.push_back ({ "File I/O",
+                  Ms (Clock::now () - t0).count (), cur_host_rss_kb (), -1 });
+
+              if (cfg.verbose)
+                std::cout << "Written : " << cfg.output_stem << ".pairs  "
+                          << cfg.output_stem << ".vals\n";
+            }
+          else
+            {
+              t0 = Clock::now ();
+              result.matrix.save_binary (cfg.output_stem + ".bin");
+              plsf::write_filtration_values (
+                  result.filt_values, cfg.output_stem);
+              rows.push_back ({ "File I/O",
+                  Ms (Clock::now () - t0).count (), cur_host_rss_kb (), -1 });
+
+              if (cfg.verbose)
+                std::cout << "Written : " << cfg.output_stem << ".bin  "
+                          << cfg.output_stem << ".vals\n";
+            }
         }
     }
   catch (const sycl::exception &e)

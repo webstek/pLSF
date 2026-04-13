@@ -23,7 +23,6 @@
 #include <string>
 #include <vector>
 
-#include "boundary.hpp"
 #include "grid.hpp"
 
 namespace plsf
@@ -267,52 +266,21 @@ Grid<scalar> read_nifti (const std::filesystem::path &path)
   return Grid<scalar>{ Nx, Ny, Nz, std::move (data) };
 }
 
-/// @brief Serialise a BoundaryMatrix to PHAT binary format
-/// @param bm    boundary matrix to write
+/// @brief Write filtration values to binary file
+/// @param filt_values  vector of filtration values (one per cell)
 /// @param stem  output path without extension
 /// @details
-/// Produces two files:
-///   <stem>.bin  - int64 stream consumed by `phat --binary`
-///                 Layout: num_cells, then per cell: dim, bnd_size,
-///                 bnd_indices...
-///   <stem>.vals - flat binary array of num_cells doubles
-///                 Use to map PHAT's (birth_col, death_col) pairs to
-///                 birth/death values
-template <typename scalar>
-void write_phat_binary (
-    BoundaryMatrix<scalar> const &bm, std::string const &stem)
+/// Produces <stem>.vals - flat binary array of doubles.
+/// Use to map PHAT column indices to birth/death values.
+inline void write_filtration_values (
+    std::vector<double> const &filt_values, std::string const &stem)
 {
-  {
-    std::ofstream f (stem + ".bin", std::ios::binary);
-    if (!f)
-      throw std::runtime_error ("cannot open " + stem + ".bin for writing");
+  std::ofstream f (stem + ".vals", std::ios::binary);
+  if (!f)
+    throw std::runtime_error ("cannot open " + stem + ".vals for writing");
 
-    auto write_i64 = [&] (int64_t v) {
-      f.write (reinterpret_cast<const char *> (&v), sizeof (v));
-    };
-
-    write_i64 (static_cast<int64_t> (bm.num_cells));
-    uint64_t offset = 0;
-    for (uint64_t p = 0; p < bm.num_cells; ++p)
-      {
-        const int64_t bnd_size = static_cast<int64_t> (2 * bm.dims[p]);
-        write_i64 (static_cast<int64_t> (bm.dims[p]));
-        write_i64 (bnd_size);
-        for (int64_t b = 0; b < bnd_size; ++b)
-          write_i64 (static_cast<int64_t> (
-              bm.boundaries[offset + static_cast<uint64_t> (b)]));
-        offset += static_cast<uint64_t> (bnd_size);
-      }
-  }
-
-  {
-    std::ofstream f (stem + ".vals", std::ios::binary);
-    if (!f)
-      throw std::runtime_error ("cannot open " + stem + ".vals for writing");
-
-    f.write (reinterpret_cast<const char *> (bm.filt_values.data ()),
-        static_cast<std::streamsize> (bm.num_cells * sizeof (double)));
-  }
+  f.write (reinterpret_cast<const char *> (filt_values.data ()),
+      static_cast<std::streamsize> (filt_values.size () * sizeof (double)));
 }
 
 } // namespace plsf

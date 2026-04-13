@@ -14,7 +14,7 @@
 # ── Configuration ──────────────────────────────────────────────────────────────
 CXX                 := acpp
 CXXFLAGS            := -std=c++17 -Wall -Wextra
-INCLUDE_DIRS        := -I./src
+INCLUDE_DIRS        := -I./src -I./lib/phat/include
 LDFLAGS             :=
 
 # Build modes
