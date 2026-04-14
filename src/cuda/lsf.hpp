@@ -26,12 +26,15 @@ template <typename scalar> struct LowerStarFiltration
   Grid<scalar>           grid;
   CubicalComplex<scalar> cc;
   std::vector<uint32_t>  ordering;
+  bool                   lossy = false; ///< single-pass lossy sort (float only)
 
   /// Device cube map — persists across compute_complex → compute_ordering
   /// so that the data stays on the GPU for the sort without a round-trip.
   scalar *d_cube_map = nullptr;
 
-  LowerStarFiltration (Grid<scalar> const &grid) : grid (grid) {}
+  LowerStarFiltration (Grid<scalar> const &grid, bool lossy = false)
+      : grid (grid), lossy (lossy)
+  {}
 
   ~LowerStarFiltration ()
   {
@@ -113,7 +116,7 @@ template <typename scalar> struct LowerStarFiltration
     CUDA_CHECK (cudaMalloc (&d_ordering, n_cells * sizeof (uint32_t)));
 
     cuda::launch_sort_filtration (
-        d_cube_map, d_ordering, Nx, Ny, Nz, n_cells);
+        d_cube_map, d_ordering, Nx, Ny, Nz, n_cells, lossy);
 
     CUDA_CHECK (cudaMemcpy (ordering.data (), d_ordering,
       n_cells * sizeof (uint32_t), cudaMemcpyDeviceToHost));

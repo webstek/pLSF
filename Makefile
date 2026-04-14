@@ -1,5 +1,5 @@
 # Makefile for pLSF – Parallelized Lower-Star Filtration
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Build system: CUDA + host C++
 # Compilers: nvcc (CUDA), g++ (host C++)
 #
@@ -9,9 +9,9 @@
 #   make debug            # build with debugging symbols
 #   make clean            # remove build artifacts
 #   make run              # build and run with default settings
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
-# ── Configuration ──────────────────────────────────────────────────────────────
+# Configuration 
 NVCC                := nvcc
 CXX                 := g++
 CXXFLAGS            := -std=c++17 -Wall -Wextra
@@ -42,9 +42,9 @@ NVCCFLAGS           += -arch=$(CUDA_ARCH)
 
 # OpenMP for boundary matrix computation
 CXXFLAGS            += -fopenmp
-LDFLAGS             += -Xcompiler -fopenmp
+LDFLAGS             += -Xcompiler -fopenmp -lstdc++fs
 
-# ── File organization ─────────────────────────────────────────────────────────
+# File organization 
 SRC_DIR             := src
 CUDA_DIR            := src/cuda
 BUILD_DIR           := build
@@ -62,7 +62,7 @@ OBJECTS             := $(MAIN_OBJ) $(CUDA_OBJS)
 # Output binary
 EXECUTABLE          := $(BIN_DIR)/plsf
 
-# ── Targets ────────────────────────────────────────────────────────────────────
+# Targets 
 .PHONY: all release debug clean run info help
 
 # Default target

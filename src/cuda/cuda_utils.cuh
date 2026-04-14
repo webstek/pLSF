@@ -17,7 +17,7 @@
 namespace plsf
 {
 
-// ── Error handling ──────────────────────────────────────────────────────────
+//  Error handling 
 
 #define CUDA_CHECK(call)                                                      \
   do                                                                          \
@@ -31,7 +31,7 @@ namespace plsf
     }                                                                         \
   while (0)
 
-// ── Device preference ───────────────────────────────────────────────────────
+//  Device preference 
 
 enum class DevicePreference
 {

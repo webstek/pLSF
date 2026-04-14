@@ -36,6 +36,9 @@ struct Config
   bool        pairs = false; ///< compute persistence pairs via phat
   bool filtration_only
       = false; ///< stop after filtration; do not compute boundary matrix
+  bool compress = false; ///< use uint8_t filtration values to reduce GPU memory
+  bool lossy    = false; ///< encode dimension in bottom 2 bits of sortable key
+                        ///<   (float/double only; incompatible with --compress)
 };
 
 static void print_usage (const char *prog)
@@ -53,6 +56,13 @@ static void print_usage (const char *prog)
                "only)\n"
                "  -f, --filtration-only Stop after filtration is computed\n"
                "                        (skip boundary matrix and output)\n"
+               "  -x, --compress        Use uint8_t filtration values instead\n"
+               "                        of the NIfTI native type to reduce\n"
+               "                        GPU memory pressure  [off]\n"
+               "  -l, --lossy           Encode cell dimension in the 2 LSBs of\n"
+               "                        the sortable float key, enabling a\n"
+               "                        single-pass sort (float/double only)\n"
+               "                        Incompatible with --compress  [off]\n"
                "  -t, --timings         Report per-step wall time and memory "
                "usage  [off]\n"
                "  -v, --verbose         Print device info and grid statistics  "
@@ -95,6 +105,10 @@ static Config parse_args (int argc, char *argv[])
         cfg.pairs = true;
       else if (a == "-f" || a == "--filtration-only")
         cfg.filtration_only = true;
+      else if (a == "-x" || a == "--compress")
+        cfg.compress = true;
+      else if (a == "-l" || a == "--lossy")
+        cfg.lossy = true;
       else if ((a == "-d" || a == "--device") && i + 1 < argc)
         cfg.device_hint = argv[++i];
       else if ((a == "-o" || a == "--output") && i + 1 < argc)
@@ -123,6 +137,11 @@ static Config parse_args (int argc, char *argv[])
     {
       std::cerr
           << "Error: --output cannot be used with --filtration-only.\n";
+      std::exit (1);
+    }
+  if (cfg.lossy && cfg.compress)
+    {
+      std::cerr << "Error: --lossy cannot be used with --compress.\n";
       std::exit (1);
     }
   return cfg;
@@ -212,6 +231,114 @@ static void print_timings (const std::vector<TimingRow> &rows)
 }
 
 // ****************************************************************************
+// Templated pipeline (scalar = float for normal mode, uint8_t for --compress)
+
+template <typename scalar>
+static void run_pipeline (const Config &cfg, std::vector<TimingRow> &rows)
+{
+  // NIfTI load
+  if (cfg.verbose)
+    std::cout << "Loading : " << cfg.input_path << '\n';
+
+  auto               t0   = Clock::now ();
+  plsf::Grid<scalar> grid = plsf::read_nifti<scalar> (cfg.input_path);
+  rows.push_back ({ "NIfTI load", Ms (Clock::now () - t0).count (),
+      cur_host_rss_kb (), -1 });
+
+  if (cfg.verbose)
+    std::cout << "Grid    : " << grid.Nx << " x " << grid.Ny << " x "
+              << grid.Nz << "  (" << grid.Nx * grid.Ny * grid.Nz
+              << " cells total)\n";
+
+  // Precompute grid dimensions for device memory accounting
+  const uint64_t Nx     = static_cast<uint64_t> (grid.Nx);
+  const uint64_t Ny     = static_cast<uint64_t> (grid.Ny);
+  const uint64_t Nz     = static_cast<uint64_t> (grid.Nz);
+  const uint64_t n_grid = Nx * Ny * Nz;
+  const uint64_t n_cells = (2 * Nx - 1) * (2 * Ny - 1) * (2 * Nz - 1);
+
+  plsf::LowerStarFiltration<scalar> filtration (grid, cfg.lossy);
+
+  // Complex computation
+  t0 = Clock::now ();
+  filtration.compute_complex ();
+  {
+    // Peak device: d_grid and d_cube_map live simultaneously
+    const long dev_kb
+        = static_cast<long> ((n_grid + n_cells) * sizeof (scalar) / 1024);
+    rows.push_back ({ "Complex computation",
+        Ms (Clock::now () - t0).count (), cur_host_rss_kb (), dev_kb });
+  }
+
+  // Complex sorting
+  t0 = Clock::now ();
+  filtration.compute_ordering ();
+  {
+    // Peak device: d_cube_map + d_ordering + d_keys (+ thrust temp)
+    const long dev_kb = static_cast<long> (
+        n_cells * (sizeof (scalar) + 2 * sizeof (uint32_t)) / 1024);
+    rows.push_back ({ "Complex sorting", Ms (Clock::now () - t0).count (),
+        cur_host_rss_kb (), dev_kb });
+  }
+
+  if (cfg.filtration_only)
+    {
+      if (cfg.verbose)
+        std::cout
+            << "Filtration computed; exiting due to --filtration-only.\n";
+      return;
+    }
+
+  // Boundary matrix computation + output
+  if (!cfg.output_stem.empty ())
+    {
+      if (cfg.verbose)
+        std::cout << "Computing boundary matrix...\n";
+
+      // No device memory used — inv_ordering (4 bytes/cell) is the only
+      // intermediate host allocation beyond the phat representation.
+      t0          = Clock::now ();
+      auto result = plsf::compute_boundary_matrix (filtration);
+      rows.push_back ({ "Boundary matrix", Ms (Clock::now () - t0).count (),
+          cur_host_rss_kb (), -1 });
+
+      if (cfg.pairs)
+        {
+          if (cfg.verbose)
+            std::cout << "Computing persistence pairs...\n";
+
+          t0 = Clock::now ();
+          phat::persistence_pairs pairs;
+          phat::compute_persistence_pairs (pairs, result.matrix);
+          rows.push_back ({ "Persistence pairs",
+              Ms (Clock::now () - t0).count (), cur_host_rss_kb (), -1 });
+
+          t0 = Clock::now ();
+          pairs.save_binary (cfg.output_stem + ".pairs");
+          plsf::write_filtration_values (result.filt_values, cfg.output_stem);
+          rows.push_back ({ "File I/O", Ms (Clock::now () - t0).count (),
+              cur_host_rss_kb (), -1 });
+
+          if (cfg.verbose)
+            std::cout << "Written : " << cfg.output_stem << ".pairs  "
+                      << cfg.output_stem << ".vals\n";
+        }
+      else
+        {
+          t0 = Clock::now ();
+          result.matrix.save_binary (cfg.output_stem + ".bin");
+          plsf::write_filtration_values (result.filt_values, cfg.output_stem);
+          rows.push_back ({ "File I/O", Ms (Clock::now () - t0).count (),
+              cur_host_rss_kb (), -1 });
+
+          if (cfg.verbose)
+            std::cout << "Written : " << cfg.output_stem << ".bin  "
+                      << cfg.output_stem << ".vals\n";
+        }
+    }
+}
+
+// ****************************************************************************
 int main (int argc, char *argv[])
 {
   const Config cfg = parse_args (argc, argv);
@@ -231,107 +358,10 @@ int main (int argc, char *argv[])
 
   try
     {
-      // NIfTI load
-      if (cfg.verbose)
-        std::cout << "Loading : " << cfg.input_path << '\n';
-
-      auto              t0 = Clock::now ();
-      plsf::Grid<float> grid = plsf::read_nifti<float> (cfg.input_path);
-      rows.push_back ({ "NIfTI load", Ms (Clock::now () - t0).count (),
-          cur_host_rss_kb (), -1 });
-
-      if (cfg.verbose)
-        std::cout << "Grid    : " << grid.Nx << " x " << grid.Ny << " x "
-                  << grid.Nz << "  (" << grid.Nx * grid.Ny * grid.Nz
-                  << " cells total)\n";
-
-      // Precompute grid dimensions for device memory accounting
-      const uint64_t Nx = static_cast<uint64_t> (grid.Nx);
-      const uint64_t Ny = static_cast<uint64_t> (grid.Ny);
-      const uint64_t Nz = static_cast<uint64_t> (grid.Nz);
-      const uint64_t n_grid = Nx * Ny * Nz;
-      const uint64_t n_cells = (2 * Nx - 1) * (2 * Ny - 1) * (2 * Nz - 1);
-
-      plsf::LowerStarFiltration<float> filtration (grid);
-
-      // Complex computation
-      t0 = Clock::now ();
-      filtration.compute_complex ();
-      {
-        // Peak device: d_grid and d_cube_map live simultaneously
-        const long dev_kb
-            = static_cast<long> ((n_grid + n_cells) * sizeof (float) / 1024);
-        rows.push_back ({ "Complex computation",
-            Ms (Clock::now () - t0).count (), cur_host_rss_kb (), dev_kb });
-      }
-
-      // Complex sorting
-      t0 = Clock::now ();
-      filtration.compute_ordering ();
-      {
-        // Peak device: d_cube_map + d_ordering + d_keys (+ thrust temp)
-        const long dev_kb = static_cast<long> (
-          n_cells * (sizeof (float) + 2 * sizeof (uint32_t)) / 1024);
-        rows.push_back ({ "Complex sorting", Ms (Clock::now () - t0).count (),
-            cur_host_rss_kb (), dev_kb });
-      }
-
-      if (cfg.filtration_only)
-        {
-          if (cfg.verbose)
-            std::cout
-                << "Filtration computed; exiting due to --filtration-only.\n";
-        }
-
-      // Boundary matrix computation + output
-      if (!cfg.filtration_only && !cfg.output_stem.empty ())
-        {
-          if (cfg.verbose)
-            std::cout << "Computing boundary matrix...\n";
-
-          // No device memory used — inv_ordering (4 bytes/cell) is the only
-          // intermediate host allocation beyond the phat representation.
-          t0 = Clock::now ();
-          auto result = plsf::compute_boundary_matrix (filtration);
-          rows.push_back ({ "Boundary matrix", Ms (Clock::now () - t0).count (),
-              cur_host_rss_kb (), -1 });
-
-          if (cfg.pairs)
-            {
-              if (cfg.verbose)
-                std::cout << "Computing persistence pairs...\n";
-
-              t0 = Clock::now ();
-              phat::persistence_pairs pairs;
-              phat::compute_persistence_pairs (pairs, result.matrix);
-              rows.push_back ({ "Persistence pairs",
-                  Ms (Clock::now () - t0).count (), cur_host_rss_kb (), -1 });
-
-              t0 = Clock::now ();
-              pairs.save_binary (cfg.output_stem + ".pairs");
-              plsf::write_filtration_values (
-                  result.filt_values, cfg.output_stem);
-              rows.push_back ({ "File I/O", Ms (Clock::now () - t0).count (),
-                  cur_host_rss_kb (), -1 });
-
-              if (cfg.verbose)
-                std::cout << "Written : " << cfg.output_stem << ".pairs  "
-                          << cfg.output_stem << ".vals\n";
-            }
-          else
-            {
-              t0 = Clock::now ();
-              result.matrix.save_binary (cfg.output_stem + ".bin");
-              plsf::write_filtration_values (
-                  result.filt_values, cfg.output_stem);
-              rows.push_back ({ "File I/O", Ms (Clock::now () - t0).count (),
-                  cur_host_rss_kb (), -1 });
-
-              if (cfg.verbose)
-                std::cout << "Written : " << cfg.output_stem << ".bin  "
-                          << cfg.output_stem << ".vals\n";
-            }
-        }
+      if (cfg.compress)
+        run_pipeline<uint8_t> (cfg, rows);
+      else
+        run_pipeline<float> (cfg, rows);
     }
   catch (const std::exception &e)
     {
