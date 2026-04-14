@@ -240,32 +240,31 @@ static void run_pipeline (const Config &cfg, std::vector<TimingRow> &rows)
   if (cfg.verbose)
     std::cout << "Loading : " << cfg.input_path << '\n';
 
-  auto               t0   = Clock::now ();
-  plsf::Grid<scalar> grid = plsf::read_nifti<scalar> (cfg.input_path);
+  auto                          t0 = Clock::now ();
+  plsf::CubicalComplex<scalar>  cc = plsf::read_nifti<scalar> (cfg.input_path);
   rows.push_back ({ "NIfTI load", Ms (Clock::now () - t0).count (),
       cur_host_rss_kb (), -1 });
 
   if (cfg.verbose)
-    std::cout << "Grid    : " << grid.Nx << " x " << grid.Ny << " x "
-              << grid.Nz << "  (" << grid.Nx * grid.Ny * grid.Nz
-              << " cells total)\n";
+    std::cout << "Grid    : " << cc.Nx << " x " << cc.Ny << " x "
+              << cc.Nz << "  (" << cc.Nx * cc.Ny * cc.Nz
+              << " voxels)\n";
 
   // Precompute grid dimensions for device memory accounting
-  const uint64_t Nx     = static_cast<uint64_t> (grid.Nx);
-  const uint64_t Ny     = static_cast<uint64_t> (grid.Ny);
-  const uint64_t Nz     = static_cast<uint64_t> (grid.Nz);
-  const uint64_t n_grid = Nx * Ny * Nz;
+  const uint64_t Nx     = static_cast<uint64_t> (cc.Nx);
+  const uint64_t Ny     = static_cast<uint64_t> (cc.Ny);
+  const uint64_t Nz     = static_cast<uint64_t> (cc.Nz);
   const uint64_t n_cells = (2 * Nx - 1) * (2 * Ny - 1) * (2 * Nz - 1);
 
-  plsf::LowerStarFiltration<scalar> filtration (grid, cfg.lossy);
+  plsf::LowerStarFiltration<scalar> filtration (std::move (cc), cfg.lossy);
 
   // Complex computation
   t0 = Clock::now ();
   filtration.compute_complex ();
   {
-    // Peak device: d_grid and d_cube_map live simultaneously
+    // Peak device: d_cube_map only (in-place computation)
     const long dev_kb
-        = static_cast<long> ((n_grid + n_cells) * sizeof (scalar) / 1024);
+        = static_cast<long> (n_cells * sizeof (scalar) / 1024);
     rows.push_back ({ "Complex computation",
         Ms (Clock::now () - t0).count (), cur_host_rss_kb (), dev_kb });
   }

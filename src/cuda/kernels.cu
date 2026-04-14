@@ -58,15 +58,18 @@ __device__ __forceinline__ uint32_t to_sortable_key<uint8_t> (uint8_t val)
   return static_cast<uint32_t> (val);
 }
 
-/// @brief Kernel: assign each cell its filtration value via vertex-max rule
+/// @brief Kernel: assign each non-vertex cell its filtration value via
+///        vertex-max rule, working in-place on the cube map.
 /// @details One thread per voxel.  Each thread block cooperatively loads a
-///          (BX+1)×(BY+1)×(BZ+1) tile of the scalar grid into shared memory,
-///          then every thread writes up to 8 cubical-complex cells (vertex,
-///          edges, faces, cube) in the "+" neighbourhood of its voxel.
-///          Boundary voxels skip cells whose neighbour falls outside the grid.
+///          (BX+1)×(BY+1)×(BZ+1) tile of vertex values from even-coordinate
+///          positions in d_cube_map into shared memory, then every thread
+///          writes up to 7 cubical-complex cells (edges, faces, cube) in the
+///          "+" neighbourhood of its voxel.  Vertex values are already in
+///          place and are not written.  Boundary voxels skip cells whose
+///          neighbour falls outside the grid.
 template <typename scalar>
-__global__ void compute_complex_kernel (const scalar *__restrict__ d_grid,
-    scalar *__restrict__ d_cube_map, uint64_t Nx, uint64_t Ny, uint64_t Nz,
+__global__ void compute_complex_kernel (scalar *__restrict__ d_cube_map,
+    uint64_t Nx, uint64_t Ny, uint64_t Nz,
     uint64_t Mx, uint64_t My, uint64_t MxMy)
 {
   __shared__ scalar s_tile[CC_SX * CC_SY * CC_SZ];
@@ -80,7 +83,7 @@ __global__ void compute_complex_kernel (const scalar *__restrict__ d_grid,
   const uint64_t by0 = static_cast<uint64_t> (blockIdx.y) * CC_BY;
   const uint64_t bz0 = static_cast<uint64_t> (blockIdx.z) * CC_BZ;
 
-  //  Cooperatively load the tile (including +1 halo) 
+  //  Cooperatively load vertex tile from even positions in d_cube_map 
   for (int s = tid; s < TILE_SIZE; s += BLOCK_THREADS)
     {
       const int sx = s % CC_SX;
@@ -92,7 +95,7 @@ __global__ void compute_complex_kernel (const scalar *__restrict__ d_grid,
       const uint64_t gz = bz0 + sz;
 
       s_tile[s] = (gx < Nx && gy < Ny && gz < Nz)
-                      ? d_grid[gx + Nx * gy + Nx * Ny * gz]
+                      ? d_cube_map[2 * gx + Mx * 2 * gy + MxMy * 2 * gz]
                       : scalar (0);
     }
   __syncthreads ();
@@ -135,10 +138,7 @@ __global__ void compute_complex_kernel (const scalar *__restrict__ d_grid,
 
 #define CUBE(a, b, c) d_cube_map[(a) + Mx * (b) + MxMy * (c)]
 
-  // Vertex (dim 0) 
-  CUBE (cx, cy, cz) = v000;
-
-  // Edges (dim 1) 
+  // Edges (dim 1) — vertices already in place, skip vertex write
   if (hx)
     CUBE (cx + 1, cy, cz) = scalar_max (v000, v100);
   if (hy)
@@ -168,14 +168,14 @@ __global__ void compute_complex_kernel (const scalar *__restrict__ d_grid,
 }
 
 // Explicit template instantiations
-template __global__ void compute_complex_kernel<float> (const float *,
+template __global__ void compute_complex_kernel<float> (
     float *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-template __global__ void compute_complex_kernel<uint8_t> (const uint8_t *,
+template __global__ void compute_complex_kernel<uint8_t> (
     uint8_t *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
 template <typename scalar>
-static void launch_compute_complex_impl (const scalar *d_grid,
-    scalar *d_cube_map, uint64_t Nx, uint64_t Ny, uint64_t Nz)
+static void launch_compute_complex_impl (scalar *d_cube_map,
+    uint64_t Nx, uint64_t Ny, uint64_t Nz)
 {
   const uint64_t Mx   = 2 * Nx - 1;
   const uint64_t My   = 2 * Ny - 1;
@@ -187,22 +187,22 @@ static void launch_compute_complex_impl (const scalar *d_grid,
       static_cast<unsigned> ((Nz + CC_BZ - 1) / CC_BZ));
 
   compute_complex_kernel<scalar><<<grid_dim, block>>> (
-      d_grid, d_cube_map, Nx, Ny, Nz, Mx, My, MxMy);
+      d_cube_map, Nx, Ny, Nz, Mx, My, MxMy);
 
   CUDA_CHECK (cudaGetLastError ());
   CUDA_CHECK (cudaDeviceSynchronize ());
 }
 
-void launch_compute_complex (const float *d_grid, float *d_cube_map,
+void launch_compute_complex (float *d_cube_map,
     uint64_t Nx, uint64_t Ny, uint64_t Nz, uint64_t /*n_cells*/)
 {
-  launch_compute_complex_impl (d_grid, d_cube_map, Nx, Ny, Nz);
+  launch_compute_complex_impl (d_cube_map, Nx, Ny, Nz);
 }
 
-void launch_compute_complex (const uint8_t *d_grid, uint8_t *d_cube_map,
+void launch_compute_complex (uint8_t *d_cube_map,
     uint64_t Nx, uint64_t Ny, uint64_t Nz, uint64_t /*n_cells*/)
 {
-  launch_compute_complex_impl (d_grid, d_cube_map, Nx, Ny, Nz);
+  launch_compute_complex_impl (d_cube_map, Nx, Ny, Nz);
 }
 // ****************************************************************************
 

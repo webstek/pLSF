@@ -49,9 +49,10 @@ template <typename T> T bswap (T v)
 }
 
 template <typename scalar, typename src_t>
-void convert_voxels (std::vector<scalar> &dst, const std::vector<char> &raw,
-    std::size_t n, bool swap, bool apply_scale, double scl_slope,
-    double scl_inter)
+void convert_voxels_scattered (std::vector<scalar> &dst,
+    const std::vector<char> &raw, std::size_t n, std::size_t Nx,
+    std::size_t Ny, std::size_t Mx, std::size_t MxMy, bool swap,
+    bool apply_scale, double scl_slope, double scl_inter)
 {
   for (std::size_t i = 0; i < n; ++i)
     {
@@ -59,21 +60,29 @@ void convert_voxels (std::vector<scalar> &dst, const std::vector<char> &raw,
       std::memcpy (&v, raw.data () + i * sizeof (src_t), sizeof (src_t));
       if (swap)
         v = bswap (v);
+
+      const std::size_t gx = i % Nx;
+      const std::size_t gy = (i / Nx) % Ny;
+      const std::size_t gz = i / (Nx * Ny);
+      const std::size_t cm_idx = 2 * gx + Mx * 2 * gy + MxMy * 2 * gz;
+
       if (apply_scale)
-        dst[i] = static_cast<scalar> (
+        dst[cm_idx] = static_cast<scalar> (
             scl_slope * static_cast<double> (v) + scl_inter);
       else
-        dst[i] = static_cast<scalar> (v);
+        dst[cm_idx] = static_cast<scalar> (v);
     }
 }
 
 } // namespace detail
 
-/// @brief Read a NIfTI-1 or NIfTI-2 (.nii) file into a Grid
+/// @brief Read a NIfTI-1 or NIfTI-2 (.nii) file into a CubicalComplex
 /// @tparam scalar  datatype to cast voxels into
 /// @param path     path to the .nii file
+/// @details Voxels are placed directly at vertex positions (even coordinates)
+///          in the cube map, saving a separate grid allocation.
 template <typename scalar>
-Grid<scalar> read_nifti (const std::filesystem::path &path)
+CubicalComplex<scalar> read_nifti (const std::filesystem::path &path)
 {
   std::ifstream file (path, std::ios::binary);
   if (!file)
@@ -184,9 +193,14 @@ Grid<scalar> read_nifti (const std::filesystem::path &path)
       scl_inter = intr;
     }
 
-  // Read and convert voxel data
+  // Read and convert voxel data directly into the cubical complex
   const bool        apply_scale = (scl_slope != 0.0);
   const std::size_t n = Nx * Ny * Nz;
+  const std::size_t Mx = 2 * Nx - 1;
+  const std::size_t My = 2 * Ny - 1;
+  const std::size_t Mz = 2 * Nz - 1;
+  const std::size_t MxMy = Mx * My;
+  const std::size_t n_cells = Mx * My * Mz;
 
   file.seekg (static_cast<std::streamoff> (vox_offset));
 
@@ -223,47 +237,55 @@ Grid<scalar> read_nifti (const std::filesystem::path &path)
     throw std::runtime_error (
         "read_nifti: unexpected EOF in '" + path.string () + "'");
 
-  std::vector<scalar> data (n);
+  std::vector<scalar> cube_map (n_cells);
 
   switch (datatype)
     {
     case 2:
-      detail::convert_voxels<scalar, uint8_t> (
-          data, raw, n, swap, apply_scale, scl_slope, scl_inter);
+      detail::convert_voxels_scattered<scalar, uint8_t> (
+          cube_map, raw, n, Nx, Ny, Mx, MxMy, swap, apply_scale, scl_slope,
+          scl_inter);
       break;
     case 4:
-      detail::convert_voxels<scalar, int16_t> (
-          data, raw, n, swap, apply_scale, scl_slope, scl_inter);
+      detail::convert_voxels_scattered<scalar, int16_t> (
+          cube_map, raw, n, Nx, Ny, Mx, MxMy, swap, apply_scale, scl_slope,
+          scl_inter);
       break;
     case 8:
-      detail::convert_voxels<scalar, int32_t> (
-          data, raw, n, swap, apply_scale, scl_slope, scl_inter);
+      detail::convert_voxels_scattered<scalar, int32_t> (
+          cube_map, raw, n, Nx, Ny, Mx, MxMy, swap, apply_scale, scl_slope,
+          scl_inter);
       break;
     case 16:
-      detail::convert_voxels<scalar, float> (
-          data, raw, n, swap, apply_scale, scl_slope, scl_inter);
+      detail::convert_voxels_scattered<scalar, float> (
+          cube_map, raw, n, Nx, Ny, Mx, MxMy, swap, apply_scale, scl_slope,
+          scl_inter);
       break;
     case 64:
-      detail::convert_voxels<scalar, double> (
-          data, raw, n, swap, apply_scale, scl_slope, scl_inter);
+      detail::convert_voxels_scattered<scalar, double> (
+          cube_map, raw, n, Nx, Ny, Mx, MxMy, swap, apply_scale, scl_slope,
+          scl_inter);
       break;
     case 256:
-      detail::convert_voxels<scalar, int8_t> (
-          data, raw, n, swap, apply_scale, scl_slope, scl_inter);
+      detail::convert_voxels_scattered<scalar, int8_t> (
+          cube_map, raw, n, Nx, Ny, Mx, MxMy, swap, apply_scale, scl_slope,
+          scl_inter);
       break;
     case 512:
-      detail::convert_voxels<scalar, uint16_t> (
-          data, raw, n, swap, apply_scale, scl_slope, scl_inter);
+      detail::convert_voxels_scattered<scalar, uint16_t> (
+          cube_map, raw, n, Nx, Ny, Mx, MxMy, swap, apply_scale, scl_slope,
+          scl_inter);
       break;
     case 768:
-      detail::convert_voxels<scalar, uint32_t> (
-          data, raw, n, swap, apply_scale, scl_slope, scl_inter);
+      detail::convert_voxels_scattered<scalar, uint32_t> (
+          cube_map, raw, n, Nx, Ny, Mx, MxMy, swap, apply_scale, scl_slope,
+          scl_inter);
       break;
     default:
       break; // unreachable; handled above
     }
 
-  return Grid<scalar>{ Nx, Ny, Nz, std::move (data) };
+  return CubicalComplex<scalar>{ Nx, Ny, Nz, std::move (cube_map) };
 }
 
 /// @brief Write filtration values to binary file

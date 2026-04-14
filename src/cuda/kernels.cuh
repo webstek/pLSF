@@ -14,14 +14,16 @@ namespace plsf
 namespace cuda
 {
 
-/// @brief Compute the cubical complex filtration values (vertex-max rule)
-/// @param d_grid      Device pointer to the input scalar grid (Nx*Ny*Nz)
-/// @param d_cube_map  Device pointer to the output cube map (Mx*My*Mz)
-/// @param Nx, Ny, Nz  Grid dimensions
+/// @brief Compute the cubical complex filtration values in-place (vertex-max
+///        rule).  Vertex values must already be at even-coordinate positions
+///        in d_cube_map; the kernel fills edges, faces, and cubes.
+/// @param d_cube_map  Device pointer to the cube map (Mx*My*Mz), with vertex
+///                    values pre-populated at even-even-even positions
+/// @param Nx, Ny, Nz  Grid dimensions (number of vertices per axis)
 /// @param n_cells     Total number of cells in the cubical complex
-void launch_compute_complex (const float *d_grid, float *d_cube_map,
+void launch_compute_complex (float *d_cube_map,
     uint64_t Nx, uint64_t Ny, uint64_t Nz, uint64_t n_cells);
-void launch_compute_complex (const uint8_t *d_grid, uint8_t *d_cube_map,
+void launch_compute_complex (uint8_t *d_cube_map,
     uint64_t Nx, uint64_t Ny, uint64_t Nz, uint64_t n_cells);
 
 /// @brief Sort the filtration by (value asc, dimension asc) on the GPU

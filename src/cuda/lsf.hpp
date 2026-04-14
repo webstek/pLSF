@@ -21,9 +21,11 @@ namespace plsf
 
 /// @brief lower star filtration of a 3D cubical complex (CUDA backend)
 /// @tparam scalar datatype of filtration
+/// @details The cubical complex cube_map must already contain vertex values
+///          at even-coordinate positions (as produced by read_nifti).
+///          compute_complex fills the non-vertex cells in-place.
 template <typename scalar> struct LowerStarFiltration
 {
-  Grid<scalar>           grid;
   CubicalComplex<scalar> cc;
   std::vector<uint32_t>  ordering;
   bool                   lossy = false; ///< single-pass lossy sort (float only)
@@ -32,8 +34,12 @@ template <typename scalar> struct LowerStarFiltration
   /// so that the data stays on the GPU for the sort without a round-trip.
   scalar *d_cube_map = nullptr;
 
-  LowerStarFiltration (Grid<scalar> const &grid, bool lossy = false)
-      : grid (grid), lossy (lossy)
+  LowerStarFiltration (CubicalComplex<scalar> &&cc, bool lossy = false)
+      : cc (std::move (cc)), lossy (lossy)
+  {}
+
+  LowerStarFiltration (CubicalComplex<scalar> const &cc, bool lossy = false)
+      : cc (cc), lossy (lossy)
   {}
 
   ~LowerStarFiltration ()
@@ -53,34 +59,25 @@ template <typename scalar> struct LowerStarFiltration
   }
 
   /// @brief Creates the cubical complex using vertex maximum rule (CUDA)
-  /// @details Allocates d_grid and d_cube_map on the device.  d_grid is freed
-  ///          after the kernel completes; d_cube_map is kept for
-  ///          compute_ordering so the sort can run entirely on the GPU.
+  /// @details Uploads the cube map (with vertex values at even positions)
+  ///          to the device, fills non-vertex cells in-place via the kernel,
+  ///          and copies the completed cube map back.  d_cube_map is kept
+  ///          allocated for compute_ordering so the sort can run entirely
+  ///          on the GPU.
   void compute_complex ()
   {
-    const uint64_t Nx = grid.Nx;
-    const uint64_t Ny = grid.Ny;
-    const uint64_t Nz = grid.Nz;
-    const uint64_t n_grid = Nx * Ny * Nz;
+    const uint64_t Nx = cc.Nx;
+    const uint64_t Ny = cc.Ny;
+    const uint64_t Nz = cc.Nz;
     const uint64_t n_cells
         = (2 * Nx - 1) * (2 * Ny - 1) * (2 * Nz - 1);
 
-    cc.Nx = grid.Nx;
-    cc.Ny = grid.Ny;
-    cc.Nz = grid.Nz;
-    cc.cube_map.resize (n_cells);
-
-    scalar *d_grid = nullptr;
-
-    CUDA_CHECK (cudaMalloc (&d_grid, n_grid * sizeof (scalar)));
     CUDA_CHECK (cudaMalloc (&d_cube_map, n_cells * sizeof (scalar)));
 
-    CUDA_CHECK (cudaMemcpy (d_grid, grid.data.data (),
-        n_grid * sizeof (scalar), cudaMemcpyHostToDevice));
+    CUDA_CHECK (cudaMemcpy (d_cube_map, cc.cube_map.data (),
+        n_cells * sizeof (scalar), cudaMemcpyHostToDevice));
 
-    cuda::launch_compute_complex (d_grid, d_cube_map, Nx, Ny, Nz, n_cells);
-
-    CUDA_CHECK (cudaFree (d_grid));
+    cuda::launch_compute_complex (d_cube_map, Nx, Ny, Nz, n_cells);
 
     CUDA_CHECK (cudaMemcpy (cc.cube_map.data (), d_cube_map,
         n_cells * sizeof (scalar), cudaMemcpyDeviceToHost));
