@@ -76,36 +76,71 @@ cmake --build lib/CubicalRipser/build
 
 The compiled binary will be placed at `lib/CubicalRipser/build/cubicalripser`.
 
+### DIPHA (benchmark dependency)
+
+The benchmark script can optionally compare against
+[DIPHA](https://github.com/webstek/dipha) (Distributed Persistent Homology
+Algorithm). This fork includes a `--filtration-only` mode that computes the
+filtration ordering and prints machine-parseable timing lines. DIPHA is
+included as a Git submodule at `lib/dipha`.
+
+**Requirements:** CMake, MPI (`libopenmpi-dev` or equivalent)
+
+```bash
+cmake -S lib/dipha -B lib/dipha/build
+cmake --build lib/dipha/build
+```
+
+The compiled binary will be placed at `lib/dipha/build/dipha`.
+
 ## Benchmark
 
-`examples/benchmark.py` compares the filtration construction and sorting
-phases of pLSF (GPU) against Cubical Ripser (CPU) on a 3-D NIfTI volume.
-Neither pipeline performs persistent-homology reduction; only the complex
-enumeration and sort times are measured.
+`examples/benchmark.py` compares the filtration construction time of pLSF
+(GPU), Cubical Ripser (CPU), GUDHI (CPU), and DIPHA (CPU/MPI) on 3-D NIfTI
+volumes. It accepts one or more `.nii` files and produces a summary table
+per file plus an optional plot of filtration time vs number of cells.
 
-**Python dependencies:** `pip install nibabel numpy`
+**Python dependencies:** `pip install nibabel numpy gudhi matplotlib`
 
 ```
-python examples/benchmark.py <input.nii> [options]
+python examples/benchmark.py <input.nii> [input2.nii ...] [options]
 
 Options:
-  --plsf PATH           Path to plsf binary         [bin/plsf]
-  --cubicalripser PATH   Path to cubicalripser binary [lib/CubicalRipser/build/cubicalripser]
+  --plsf PATH            Path to plsf binary          [bin/plsf]
+  --cubicalripser PATH   Path to cubicalripser binary  [lib/CubicalRipser/build/cubicalripser]
+  --dipha PATH           Path to dipha binary          [lib/dipha/build/dipha]
   --device {gpu,default} CUDA device selector for plsf [gpu]
-  --maxdim N            Max cell dimension for Cubical Ripser [3]
-  --skip-plsf           Run Cubical Ripser only
-  --skip-cripser        Run pLSF only
-  -v, --verbose         Print raw subprocess output
+  --maxdim N             Max cell dimension for Cubical Ripser [3]
+  --dipha-nodes N        Number of MPI processes for DIPHA [1]
+  --skip-plsf            Skip the pLSF pipeline
+  --skip-cripser         Skip the Cubical Ripser pipeline
+  --skip-gudhi           Skip the GUDHI pipeline
+  --skip-dipha           Skip the DIPHA pipeline
+  --plot PATH            Save time-vs-cells plot (e.g. filtration.png)
+  -x, --compress         Pass -x (uint8 mode) to pLSF
+  -l, --lossy            Pass -l (lossy dim encoding) to pLSF
+  -v, --verbose          Print raw subprocess output
 ```
+
+If a tool errors on a particular file (e.g. out of memory), the remaining
+tools still run.
 
 Sample data files are provided in `examples/data/`.
 
 ```bash
-# compare both pipelines on the bundled 1 mm atlas
+# compare all four tools on the bundled 1 mm atlas
 python examples/benchmark.py examples/data/full_cls_1000um_2009b_sym.nii
 
-# pLSF only (no CUDA Ripser needed)
-python examples/benchmark.py examples/data/full_cls_1000um_2009b_sym.nii --skip-cripser
+# multiple files with a scaling plot
+python examples/benchmark.py examples/data/*.nii --plot filtration.png
+
+# pLSF only (no other tools needed)
+python examples/benchmark.py examples/data/full_cls_1000um_2009b_sym.nii \
+    --skip-cripser --skip-gudhi --skip-dipha
+
+# run DIPHA across 4 MPI processes
+python examples/benchmark.py examples/data/full_cls_1000um_2009b_sym.nii \
+    --skip-plsf --skip-cripser --skip-gudhi --dipha-nodes 4
 
 # use CUDA default device selector and show per-step output
 python examples/benchmark.py examples/data/full_cls_1000um_2009b_sym.nii --device default -v

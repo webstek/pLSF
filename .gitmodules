@@ -4,3 +4,6 @@
 [submodule "lib/CubicalRipser"]
 	path = lib/CubicalRipser
 	url = https://github.com/webstek/CubicalRipser.git
+[submodule "lib/dipha"]
+	path = lib/dipha
+	url = https://github.com/webstek/dipha.git

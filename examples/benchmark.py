@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 # ──────────────────────────────────────────────────────────────────────────────
-# benchmark.py – Filtration & sorting time comparison: pLSF vs Cubical Ripser
+# benchmark.py – Filtration time comparison: pLSF vs Cubical Ripser vs GUDHI
+#                vs DIPHA
 # ──────────────────────────────────────────────────────────────────────────────
 """
-Compare the filtration construction and sorting phases of pLSF (GPU) against
-Cubical Ripser (CPU) on 3-D NIfTI volumes.
+Compare filtration construction time of pLSF (GPU), Cubical Ripser (CPU),
+GUDHI (CPU), and DIPHA (CPU/MPI) on 3-D NIfTI volumes.
 
-pLSF is run with ``-f -t`` (filtration-only + timings) and its structured
-table output is parsed.
+Accepts one or more .nii files and produces:
+  • A summary table per file
+  • An optional plot of filtration time vs number of cells across files
 
-Cubical Ripser is run with ``--filtration-only`` on a float64 .npy copy of
-the same volume and its ``TIMING:`` lines are parsed.
+Each tool can be skipped with ``--skip-<tool>``.  If a tool errors on a
+particular file the other tools still run.
 
 Usage:
-    python benchmark.py <input.nii> [options]
+    python benchmark.py data/*.nii [options]
+    python benchmark.py data/small.nii data/large.nii --plot filtration.png
 
 Dependencies:
-    pip install nibabel numpy
+    pip install nibabel numpy gudhi matplotlib
     External: plsf (this project),
-              cubicalripser (lib/CubicalRipser, built with --filtration-only)
+              cubicalripser (lib/CubicalRipser, built with --filtration-only),
+              dipha (lib/dipha, built with --filtration-only)
 """
 
 import argparse
@@ -35,6 +39,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 BIN_DIR = SCRIPT_DIR.parent / "bin"
 CR_BUILD_DIR = SCRIPT_DIR.parent / "lib" / "CubicalRipser" / "build"
+DIPHA_BUILD_DIR = SCRIPT_DIR.parent / "lib" / "dipha" / "build"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -71,6 +76,31 @@ def print_table(
     print()
 
 
+def load_nii_array(nii_path: Path):
+    """Load a NIfTI file and return (data_array, load_time_ms)."""
+    import nibabel as nib
+    import numpy as np
+
+    t0 = time.perf_counter()
+    img = nib.load(str(nii_path))
+    data = np.asarray(img.dataobj, dtype=np.float64)
+    load_ms = (time.perf_counter() - t0) * 1000.0
+    return data, load_ms
+
+
+def count_cells_from_shape(shape: tuple[int, ...]) -> int:
+    """Estimate total number of cells in a cubical complex from the grid shape.
+
+    For a d-dimensional grid of shape (n1, n2, ..., nd), the number of cells
+    is the product of (2*ni - 1) for each dimension (the full cubical complex
+    grid).
+    """
+    result = 1
+    for n in shape:
+        result *= 2 * n - 1
+    return result
+
+
 # ── pLSF filtration-only timing ─────────────────────────────────────────────
 
 
@@ -89,15 +119,8 @@ def run_plsf_filtration(
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"plsf failed:\n{result.stderr}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"plsf failed (exit {result.returncode}):\n{result.stderr}")
 
-    # Parse the table:
-    #   Step                        Time     Host RSS     Dev peak
-    #   ---------------------------------------------------------------
-    #   NIfTI load                23.6 ms      136 MiB            -
-    #   Complex computation      162.4 ms      433 MiB      295 MiB
-    #   Complex sorting          216.2 ms      696 MiB      788 MiB
     timings: dict[str, float] = {}
     for line in result.stdout.splitlines():
         m = re.match(r"^(\S[\w\s]+?)\s{2,}([\d.]+)\s*ms", line)
@@ -136,12 +159,10 @@ def run_cr_filtration(
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"cubicalripser failed:\n{result.stderr}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(
+            f"cubicalripser failed (exit {result.returncode}):\n{result.stderr}"
+        )
 
-    # Parse lines like:
-    #   TIMING: load_ms=232.474
-    #   TIMING: dim=1 enum_ms=1244.06 sort_ms=1228.72 cells=25898696
     load_ms = 0.0
     total_enum_ms = 0.0
     total_sort_ms = 0.0
@@ -178,53 +199,397 @@ def run_cr_filtration(
     }
 
 
+# ── GUDHI filtration timing ─────────────────────────────────────────────────
+
+
+def run_gudhi_filtration(data, verbose: bool) -> dict:
+    """Time GUDHI CubicalComplex creation and persistence on an array.
+
+    ``data`` should be a NumPy float64 array (already loaded from NIfTI).
+    We time only the CubicalComplex construction and `.persistence()` call,
+    which internally builds and sorts the filtration.
+    """
+    import gudhi as gd
+
+    t0 = time.perf_counter()
+    cc = gd.CubicalComplex(top_dimensional_cells=data)
+    construct_ms = (time.perf_counter() - t0) * 1000.0
+
+    t1 = time.perf_counter()
+    cc.persistence(homology_coeff_field=2, min_persistence=0)
+    persistence_ms = (time.perf_counter() - t1) * 1000.0
+
+    total_ms = construct_ms + persistence_ms
+
+    if verbose:
+        print(f"  GUDHI construct: {fmt_time(construct_ms)}")
+        print(f"  GUDHI persistence: {fmt_time(persistence_ms)}")
+        print(f"  GUDHI total: {fmt_time(total_ms)}")
+
+    return {
+        "construct_ms": construct_ms,
+        "persistence_ms": persistence_ms,
+        "total_ms": total_ms,
+    }
+
+
+# ── DIPHA filtration-only timing ────────────────────────────────────────────
+
+
+def nii_to_dipha_complex(nii_path: Path, complex_path: Path) -> float:
+    """Convert a NIfTI file to a DIPHA .complex and return time in ms."""
+    import struct
+    import nibabel as nib
+    import numpy as np
+
+    _DIPHA_MAGIC = 8067171840
+    _DIPHA_COMPLEX_TYPE = 1
+
+    t0 = time.perf_counter()
+    img = nib.load(str(nii_path))
+    data = np.asarray(img.dataobj, dtype=np.float64)
+
+    # DIPHA expects column-major (Fortran) ordering for 3-D data
+    shape = data.shape
+    ndim = len(shape)
+    size = int(np.prod(shape))
+    payload = data
+    if ndim == 3:
+        payload = data.transpose((2, 1, 0))
+    elif ndim == 2:
+        payload = data.transpose((1, 0))
+
+    with complex_path.open("wb") as f:
+        f.write(struct.pack("qqqq", _DIPHA_MAGIC, _DIPHA_COMPLEX_TYPE, size, ndim))
+        f.write(struct.pack("q" * ndim, *shape))
+        f.write(payload.ravel().tobytes())
+
+    return (time.perf_counter() - t0) * 1000.0
+
+
+def run_dipha_filtration(
+    complex_path: Path, dipha_bin: str, verbose: bool,
+    nprocs: int = 1,
+) -> dict:
+    """Run ``mpirun -n <nprocs> dipha --filtration-only`` and parse TIMING lines."""
+    # Use a dummy output file (DIPHA requires an output argument)
+    with tempfile.NamedTemporaryFile(suffix=".out", delete=False) as f:
+        dummy_out = f.name
+
+    cmd = ["mpirun", "--allow-run-as-root", "-n", str(nprocs),
+           dipha_bin, "--filtration-only", str(complex_path), dummy_out]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Clean up dummy output
+    Path(dummy_out).unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"dipha failed (exit {result.returncode}):\n{result.stderr}"
+        )
+
+    load_ms = 0.0
+    filtration_ms = 0.0
+    cells = 0
+
+    for line in result.stdout.splitlines():
+        if not line.startswith("TIMING:"):
+            continue
+        tokens = dict(
+            tok.split("=", 1) for tok in line.split() if "=" in tok
+        )
+        if "load_ms" in tokens:
+            load_ms = float(tokens["load_ms"])
+        if "filtration_ms" in tokens:
+            filtration_ms = float(tokens["filtration_ms"])
+        if "cells" in tokens:
+            cells = int(tokens["cells"])
+
+    if verbose:
+        print(result.stdout)
+
+    return {
+        "load_ms": load_ms,
+        "filtration_ms": filtration_ms,
+        "cells": cells,
+        "stdout": result.stdout,
+    }
+
+
+# ── Plotting ─────────────────────────────────────────────────────────────────
+
+
+def make_plot(
+    results: list[dict],
+    output_path: Path,
+) -> None:
+    """Plot filtration time (including file load) vs number of cells.
+
+    ``results`` is a list of dicts with keys:
+        "file", "num_cells",
+        "plsf_total_ms", "cr_total_ms", "gudhi_total_ms", "dipha_total_ms"
+    (any may be None if skipped or failed).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # Sort by cell count
+    results = sorted(results, key=lambda r: r["num_cells"])
+
+    cells = [r["num_cells"] for r in results]
+    labels = [Path(r["file"]).name for r in results]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    tool_keys = [
+        ("plsf_total_ms", "pLSF (GPU)", "tab:blue", "o"),
+        ("cr_total_ms", "Cubical Ripser", "tab:orange", "s"),
+        ("gudhi_total_ms", "GUDHI", "tab:green", "^"),
+        ("dipha_total_ms", "DIPHA", "tab:red", "D"),
+    ]
+
+    for key, label, color, marker in tool_keys:
+        xs, ys = [], []
+        for r, c in zip(results, cells):
+            val = r.get(key)
+            if val is not None:
+                xs.append(c)
+                ys.append(val / 1000.0)  # convert ms → seconds
+        if xs:
+            ax.plot(xs, ys, marker=marker, color=color, label=label, linewidth=2, markersize=8)
+
+    ax.set_xlabel("Number of elementary cubes in cubical complex")
+    ax.set_ylabel("Total filtration time (s)  [includes file load]")
+    ax.set_title("Filtration Time vs Number of Elementary Cubes")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    if len(cells) > 1 and max(cells) / max(min(cells), 1) > 10:
+        ax.set_xscale("log")
+    if any(r.get(k) for r in results for k, *_ in tool_keys):
+        ys_all = [
+            r.get(k) / 1000.0
+            for r in results
+            for k, *_ in tool_keys
+            if r.get(k) is not None
+        ]
+        if ys_all and max(ys_all) / max(min(ys_all), 1e-9) > 10:
+            ax.set_yscale("log")
+
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=150)
+    print(f"Plot saved to {output_path}")
+    plt.close(fig)
+
+
+# ── Per-file benchmark ───────────────────────────────────────────────────────
+
+
+def benchmark_one_file(nii_path: Path, args) -> dict:
+    """Run all enabled tools on a single NIfTI file.
+
+    Returns a result dict with timing entries (None = skipped/failed).
+    """
+    import numpy as np
+
+    print(f"\n{'═' * 68}")
+    print(f"  File: {nii_path}")
+    print(f"{'═' * 68}")
+
+    # Load once to get shape / num_cells (shared across tools)
+    data, load_ms_shared = load_nii_array(nii_path)
+    shape = data.shape
+    num_voxels = int(data.size)
+    num_cells = count_cells_from_shape(shape)
+    print(f"  Shape: {shape}   Voxels: {num_voxels:,}   Elementary cubes: {num_cells:,}")
+
+    rows: list[tuple[str, str, str]] = []
+    result: dict = {
+        "file": str(nii_path),
+        "shape": shape,
+        "num_voxels": num_voxels,
+        "num_cells": num_cells,
+        "plsf_total_ms": None,
+        "cr_total_ms": None,
+        "gudhi_total_ms": None,
+        "dipha_total_ms": None,
+    }
+
+    # ── pLSF ─────────────────────────────────────────────────────────────
+    if not args.skip_plsf:
+        plsf_bin = args.plsf
+        if not Path(plsf_bin).exists() and not which(plsf_bin):
+            print(f"  [SKIP] plsf not found at {plsf_bin}", file=sys.stderr)
+        else:
+            try:
+                info = run_plsf_filtration(
+                    nii_path, plsf_bin, args.device, args.verbose,
+                    compress=args.compress, lossy=args.lossy,
+                )
+                if args.verbose:
+                    print(info["stdout"])
+
+                rows.append(("File load", "pLSF", fmt_time(info["load_ms"])))
+                rows.append(("Filtration construction", "pLSF", fmt_time(info["enum_ms"])))
+                rows.append(("Filtration sorting", "pLSF", fmt_time(info["sort_ms"])))
+                plsf_filt_ms = info["load_ms"] + info["enum_ms"] + info["sort_ms"]
+                rows.append(("Total (load + filt)", "pLSF", fmt_time(plsf_filt_ms)))
+                result["plsf_total_ms"] = plsf_filt_ms
+            except Exception as e:
+                print(f"  [ERROR] pLSF: {e}", file=sys.stderr)
+
+    # ── Cubical Ripser ───────────────────────────────────────────────────
+    if not args.skip_cripser:
+        cr_bin = args.cubicalripser
+        if not Path(cr_bin).exists() and not which(cr_bin):
+            print(f"  [SKIP] cubicalripser not found at {cr_bin}", file=sys.stderr)
+        else:
+            try:
+                with tempfile.TemporaryDirectory(prefix="cr_bench_") as tmpdir:
+                    npy_path = Path(tmpdir) / "input.npy"
+                    conv_ms = nii_to_npy_f64(nii_path, npy_path)
+
+                    rows.append(("NIfTI -> npy conversion", "CubicalRipser", fmt_time(conv_ms)))
+
+                    cr = run_cr_filtration(npy_path, cr_bin, args.maxdim, args.verbose)
+                    if args.verbose:
+                        print(cr["stdout"])
+
+                    rows.append(("File load (.npy)", "CubicalRipser", fmt_time(cr["load_ms"])))
+
+                    for dt in cr["dim_timings"]:
+                        d = dt["dim"]
+                        rows.append((
+                            f"Dim-{d} enumeration ({dt['cells']} cells)",
+                            "CubicalRipser",
+                            fmt_time(dt["enum_ms"]),
+                        ))
+                        rows.append((
+                            f"Dim-{d} sorting",
+                            "CubicalRipser",
+                            fmt_time(dt["sort_ms"]),
+                        ))
+
+                    cr_filt_ms = conv_ms + cr["load_ms"] + cr["enum_ms"] + cr["sort_ms"]
+                    rows.append(("Total (conv + load + filt)", "CubicalRipser", fmt_time(cr_filt_ms)))
+                    result["cr_total_ms"] = cr_filt_ms
+            except Exception as e:
+                print(f"  [ERROR] CubicalRipser: {e}", file=sys.stderr)
+
+    # ── GUDHI ────────────────────────────────────────────────────────────
+    if not args.skip_gudhi:
+        try:
+            import gudhi  # noqa: F401
+        except ImportError:
+            print("  [SKIP] GUDHI not installed (pip install gudhi)", file=sys.stderr)
+        else:
+            try:
+                # data was already loaded above; charge the shared load time
+                gudhi_info = run_gudhi_filtration(data, args.verbose)
+                rows.append(("File load (shared)", "GUDHI", fmt_time(load_ms_shared)))
+                rows.append(("CubicalComplex construction", "GUDHI", fmt_time(gudhi_info["construct_ms"])))
+                rows.append(("Persistence computation", "GUDHI", fmt_time(gudhi_info["persistence_ms"])))
+                gudhi_total = load_ms_shared + gudhi_info["total_ms"]
+                rows.append(("Total (load + filt)", "GUDHI", fmt_time(gudhi_total)))
+                result["gudhi_total_ms"] = gudhi_total
+            except Exception as e:
+                print(f"  [ERROR] GUDHI: {e}", file=sys.stderr)
+
+    # ── DIPHA ────────────────────────────────────────────────────────────
+    if not args.skip_dipha:
+        dipha_bin = args.dipha
+        if not Path(dipha_bin).exists() and not which(dipha_bin):
+            print(f"  [SKIP] dipha not found at {dipha_bin}", file=sys.stderr)
+        else:
+            try:
+                with tempfile.TemporaryDirectory(prefix="dipha_bench_") as tmpdir:
+                    complex_path = Path(tmpdir) / "input.complex"
+                    conv_ms = nii_to_dipha_complex(nii_path, complex_path)
+
+                    rows.append(("NIfTI -> .complex conversion", "DIPHA", fmt_time(conv_ms)))
+
+                    dipha_info = run_dipha_filtration(
+                        complex_path, dipha_bin, args.verbose,
+                        nprocs=args.dipha_nodes,
+                    )
+
+                    rows.append(("File load (.complex)", "DIPHA", fmt_time(dipha_info["load_ms"])))
+                    rows.append(("Filtration ordering", "DIPHA", fmt_time(dipha_info["filtration_ms"])))
+
+                    dipha_total = conv_ms + dipha_info["load_ms"] + dipha_info["filtration_ms"]
+                    rows.append(("Total (conv + load + filt)", "DIPHA", fmt_time(dipha_total)))
+                    result["dipha_total_ms"] = dipha_total
+            except Exception as e:
+                print(f"  [ERROR] DIPHA: {e}", file=sys.stderr)
+
+    # ── Summary table ────────────────────────────────────────────────────
+    print_table(rows)
+
+    # Print speedup comparisons
+    totals = {
+        "pLSF": result["plsf_total_ms"],
+        "CubicalRipser": result["cr_total_ms"],
+        "GUDHI": result["gudhi_total_ms"],
+        "DIPHA": result["dipha_total_ms"],
+    }
+    active = {k: v for k, v in totals.items() if v is not None and v > 0}
+    if len(active) >= 2:
+        fastest_name = min(active, key=active.get)
+        fastest_ms = active[fastest_name]
+        for name, ms in sorted(active.items(), key=lambda x: x[1]):
+            if name != fastest_name:
+                ratio = ms / fastest_ms
+                print(
+                    f"  {fastest_name} is {ratio:.2f}x faster than {name} "
+                    f"({fmt_time(fastest_ms)} vs {fmt_time(ms)})"
+                )
+
+    return result
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare the filtration construction and sorting phases of pLSF "
-            "(GPU) against Cubical Ripser (CPU) on a 3-D NIfTI volume.\n\n"
-            "pLSF is invoked with -f -t (filtration-only + timings). Its output "
-            "table is parsed for the 'Complex computation' and 'Complex sorting' "
-            "rows.\n\n"
-            "Cubical Ripser is invoked with --filtration-only on a float64 .npy "
-            "copy of the same volume. Per-dimension enumeration and sorting times "
-            "are parsed from TIMING: lines on stdout.\n\n"
-            "Only filtration and sorting times are compared; PH reduction is not "
-            "performed by either pipeline."
+            "Compare filtration construction time of pLSF (GPU), "
+            "Cubical Ripser (CPU), GUDHI (CPU), and DIPHA (CPU/MPI) on "
+            "3-D NIfTI volumes.\n\n"
+            "Accepts one or more .nii files.  When multiple files are given, "
+            "all enabled tools are benchmarked on each file and an optional "
+            "plot of filtration time vs number of cells is produced."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  # compare both pipelines on a NIfTI volume\n"
+            "  # compare all tools on a single volume\n"
             "  python benchmark.py data/input.nii\n\n"
-            "  # use a specific device and show per-step output\n"
-            "  python benchmark.py data/input.nii --device default -v\n\n"
-            "  # run only Cubical Ripser (skip pLSF)\n"
-            "  python benchmark.py data/input.nii --skip-plsf\n\n"
-            "  # limit Cubical Ripser to H0 and H1\n"
-            "  python benchmark.py data/input.nii --maxdim 1\n"
+            "  # multiple files with a plot\n"
+            "  python benchmark.py data/*.nii --plot filtration.png\n\n"
+            "  # skip GUDHI and DIPHA\n"
+            "  python benchmark.py data/input.nii --skip-gudhi --skip-dipha\n\n"
+            "  # only pLSF\n"
+            "  python benchmark.py data/input.nii --skip-cripser --skip-gudhi --skip-dipha\n"
         ),
     )
     parser.add_argument(
-        "input",
+        "inputs",
+        nargs="+",
         type=Path,
+        metavar="INPUT",
         help=(
-            "Path to the input NIfTI file (.nii, uncompressed). "
-            "Both pipelines operate on this volume."
+            "One or more NIfTI (.nii) files to benchmark. "
+            "Each file is processed independently."
         ),
     )
     parser.add_argument(
         "--plsf",
         default=str(BIN_DIR / "plsf"),
         metavar="PATH",
-        help=(
-            "Path to the compiled plsf binary. "
-            "plsf computes the lower-star filtration on the GPU. "
-            "Default: %(default)s"
-        ),
+        help="Path to the compiled plsf binary. Default: %(default)s",
     )
     parser.add_argument(
         "--cubicalripser",
@@ -232,21 +597,20 @@ def main() -> None:
         metavar="PATH",
         help=(
             "Path to the compiled cubicalripser binary (V-construction). "
-            "Must be built from lib/CubicalRipser with the --filtration-only "
-            "patch applied (cmake --build lib/CubicalRipser/build). "
             "Default: %(default)s"
         ),
+    )
+    parser.add_argument(
+        "--dipha",
+        default=str(DIPHA_BUILD_DIR / "dipha"),
+        metavar="PATH",
+        help="Path to the compiled DIPHA binary. Default: %(default)s",
     )
     parser.add_argument(
         "--device",
         default="gpu",
         choices=["gpu", "default"],
-        help=(
-            "CUDA device selector passed to plsf via -d. "
-            "'gpu' selects the first discrete GPU; "
-            "'default' lets the CUDA runtime choose. "
-            "Default: %(default)s"
-        ),
+        help="CUDA device selector passed to plsf via -d. Default: %(default)s",
     )
     parser.add_argument(
         "--maxdim",
@@ -254,9 +618,7 @@ def main() -> None:
         default=3,
         metavar="N",
         help=(
-            "Maximum cell dimension whose filtration Cubical Ripser will "
-            "enumerate and sort. For a 3-D volume the effective ceiling is 2 "
-            "(dim-1), so values above 2 have no extra effect on 3-D inputs. "
+            "Maximum cell dimension for Cubical Ripser filtration. "
             "Default: %(default)s"
         ),
     )
@@ -264,137 +626,100 @@ def main() -> None:
     plsf_flags.add_argument(
         "-x", "--compress",
         action="store_true",
-        help=(
-            "Pass -x to pLSF: use uint8_t filtration values instead of the "
-            "NIfTI native type to reduce GPU memory pressure. "
-            "Incompatible with --lossy."
-        ),
+        help="Pass -x to pLSF: use uint8_t filtration values.",
     )
     plsf_flags.add_argument(
         "-l", "--lossy",
         action="store_true",
-        help=(
-            "Pass -l to pLSF: encode cell dimension in the 2 LSBs of the "
-            "sortable float key, enabling a single-pass sort "
-            "(float/double only). Incompatible with --compress."
-        ),
+        help="Pass -l to pLSF: lossy dimension encoding.",
     )
     parser.add_argument(
         "--skip-plsf",
         action="store_true",
-        help=(
-            "Do not run the pLSF pipeline. "
-            "Useful when only the Cubical Ripser baseline is needed, "
-            "or when no CUDA device is available."
-        ),
+        help="Do not run the pLSF pipeline.",
     )
     parser.add_argument(
         "--skip-cripser",
         action="store_true",
+        help="Do not run the Cubical Ripser pipeline.",
+    )
+    parser.add_argument(
+        "--skip-gudhi",
+        action="store_true",
+        help="Do not run the GUDHI pipeline.",
+    )
+    parser.add_argument(
+        "--skip-dipha",
+        action="store_true",
+        help="Do not run the DIPHA pipeline.",
+    )
+    parser.add_argument(
+        "--dipha-nodes",
+        type=int,
+        default=1,
+        metavar="N",
         help=(
-            "Do not run the Cubical Ripser pipeline. "
-            "Useful when only the pLSF timing is needed."
+            "Number of MPI processes (nodes) to launch DIPHA with via "
+            "'mpirun -n N'. Default: %(default)s"
+        ),
+    )
+    parser.add_argument(
+        "--plot",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Save a plot of filtration time vs number of cells to this path "
+            "(e.g. filtration.png). Requires matplotlib."
         ),
     )
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help=(
-            "Print the raw stdout of each subprocess (plsf and cubicalripser) "
-            "in addition to the summary table."
-        ),
+        help="Print raw subprocess output in addition to the summary table.",
     )
     args = parser.parse_args()
 
-    if not args.input.exists():
-        print(f"Error: {args.input} not found", file=sys.stderr)
-        sys.exit(1)
-
-    rows: list[tuple[str, str, str]] = []
-
-    # ── pLSF ─────────────────────────────────────────────────────────────
-    plsf_filt_ms = None
-    if not args.skip_plsf:
-        plsf_bin = args.plsf
-        if not Path(plsf_bin).exists() and not which(plsf_bin):
-            print(f"Error: plsf not found at {plsf_bin}", file=sys.stderr)
+    # Validate inputs
+    for inp in args.inputs:
+        if not inp.exists():
+            print(f"Error: {inp} not found", file=sys.stderr)
             sys.exit(1)
 
-        info = run_plsf_filtration(
-            args.input, plsf_bin, args.device, args.verbose,
-            compress=args.compress, lossy=args.lossy
-        )
-        if args.verbose:
-            print(info["stdout"])
+    # Run benchmarks
+    all_results: list[dict] = []
+    for nii_path in args.inputs:
+        r = benchmark_one_file(nii_path, args)
+        all_results.append(r)
 
-        rows.append(("File load", "pLSF", fmt_time(info["load_ms"])))
-        rows.append(
-            ("Filtration construction", "pLSF", fmt_time(info["enum_ms"]))
-        )
-        rows.append(("Filtration sorting", "pLSF", fmt_time(info["sort_ms"])))
-        plsf_filt_ms = info["enum_ms"] + info["sort_ms"]
-        rows.append(
-            ("Enum + sort total", "pLSF", fmt_time(plsf_filt_ms))
-        )
-
-    # ── Cubical Ripser ───────────────────────────────────────────────────
-    cr_filt_ms = None
-    if not args.skip_cripser:
-        cr_bin = args.cubicalripser
-        if not Path(cr_bin).exists() and not which(cr_bin):
+    # Multi-file summary
+    if len(all_results) > 1:
+        print(f"\n{'═' * 68}")
+        print("  Multi-file summary")
+        print(f"{'═' * 68}")
+        summary_header = f"{'File':<30} {'Voxels':>12} {'Elem. cubes':>14} {'pLSF':>10} {'CRipser':>10} {'GUDHI':>10} {'DIPHA':>10}"
+        print(summary_header)
+        print("─" * len(summary_header))
+        for r in sorted(all_results, key=lambda x: x["num_cells"]):
+            def _fmt(v):
+                return fmt_time(v) if v is not None else "-"
             print(
-                f"Error: cubicalripser not found at {cr_bin}", file=sys.stderr
+                f"{Path(r['file']).name:<30} "
+                f"{r['num_voxels']:>12,} "
+                f"{r['num_cells']:>14,} "
+                f"{_fmt(r['plsf_total_ms']):>10} "
+                f"{_fmt(r['cr_total_ms']):>10} "
+                f"{_fmt(r['gudhi_total_ms']):>10} "
+                f"{_fmt(r['dipha_total_ms']):>10}"
             )
-            sys.exit(1)
+        print()
 
-        with tempfile.TemporaryDirectory(prefix="cr_bench_") as tmpdir:
-            npy_path = Path(tmpdir) / "input.npy"
-            conv_ms = nii_to_npy_f64(args.input, npy_path)
-
-            rows.append(("NIfTI -> npy conversion", "CubicalRipser", fmt_time(conv_ms)))
-
-            cr = run_cr_filtration(npy_path, cr_bin, args.maxdim, args.verbose)
-            if args.verbose:
-                print(cr["stdout"])
-
-            rows.append(("File load (.npy)", "CubicalRipser", fmt_time(cr["load_ms"])))
-
-            for dt in cr["dim_timings"]:
-                d = dt["dim"]
-                rows.append(
-                    (
-                        f"Dim-{d} enumeration ({dt['cells']} cells)",
-                        "CubicalRipser",
-                        fmt_time(dt["enum_ms"]),
-                    )
-                )
-                rows.append(
-                    (
-                        f"Dim-{d} sorting",
-                        "CubicalRipser",
-                        fmt_time(dt["sort_ms"]),
-                    )
-                )
-
-            cr_filt_ms = cr["enum_ms"] + cr["sort_ms"]
-            rows.append(
-                ("Enum + sort total", "CubicalRipser", fmt_time(cr_filt_ms))
-            )
-
-    # ── Summary ──────────────────────────────────────────────────────────
-    print_table(rows)
-
-    if plsf_filt_ms is not None and cr_filt_ms is not None:
-        if plsf_filt_ms > 0 and cr_filt_ms > 0:
-            ratio = cr_filt_ms / plsf_filt_ms
-            if ratio >= 1.0:
-                faster, factor = "pLSF", ratio
-            else:
-                faster, factor = "CubicalRipser", 1.0 / ratio
-            print(
-                f"Speedup: {faster} filtration is {factor:.2f}x faster "
-                f"({fmt_time(plsf_filt_ms)} vs {fmt_time(cr_filt_ms)})"
-            )
+    # Generate plot
+    if args.plot:
+        try:
+            make_plot(all_results, args.plot)
+        except Exception as e:
+            print(f"Error generating plot: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
