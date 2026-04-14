@@ -8,6 +8,37 @@ and the boundary matrix is constructed directly in PHAT's
 `bit_tree_pivot_column` representation. Optionally computes persistence
 pairs via PHAT's twist reduction algorithm.
 
+## Usage
+
+```
+./bin/plsf [options] <input.nii>
+
+Options:
+  -d, --device  <mode>  CUDA device selector: gpu|default  [gpu]
+  -o, --output  <stem>  Write output files with the given stem
+  -p, --pairs           Compute persistence pairs via phat
+                        (default: output boundary matrix only)
+  -f, --filtration-only Stop after filtration is computed
+                        (skip boundary matrix and output)
+  -x, --compress        Use uint8_t filtration values instead of the NIfTI
+                        native type to reduce GPU memory pressure  [off]
+  -l, --lossy           Encode cell dimension in the 2 LSBs of the sortable
+                        float key, enabling a single-pass sort
+                        (float/double only; incompatible with --compress)  [off]
+  -t, --timings         Report per-step wall time and memory usage  [off]
+  -v, --verbose         Print device info and grid statistics  [off]
+  -h, --help            Show this message and exit
+```
+
+Input must be an uncompressed NIfTI-1/2 file (`.nii`).
+
+### Output modes (require `-o <stem>`)
+
+| Flag | Files produced | Description |
+|---|---|---|
+| (none) | `<stem>.bin`, `<stem>.vals` | PHAT binary boundary matrix + filtration values |
+| `-p` | `<stem>.pairs`, `<stem>.vals` | Persistence pairs (PHAT binary) + filtration values |
+
 ## Build
 
 **Requirements:** NVIDIA CUDA Toolkit (for `nvcc`), `make`, C++17 toolchain (`g++`)
@@ -20,45 +51,12 @@ initialise it with:
 git submodule update --init --recursive
 ```
 
-Then build normally:
-
 ```bash
-make          # release (default)
-make debug    # with debug symbols
-make clean
+make                  # release build (default)
+make release          # release build (explicit)
+make debug            # build with debug symbols
+make clean            # remove build artifacts
+make run              # build and run with default settings
+make CUDA_ARCH=sm_XX  # target a specific GPU architecture
+make help             # prints build configuration
 ```
-
-Target a specific GPU architecture when needed:
-
-```bash
-make CUDA_ARCH=sm_80
-```
-
-**Troubleshooting:**
-- **`nvcc` not found**: ensure CUDA Toolkit is installed and `nvcc` is in `PATH`
-- **Submodule issues**: run `git submodule sync --recursive && git submodule update --init --recursive`
-- **CUDA build failures**: verify driver/toolkit compatibility for your GPU
-
-## Usage
-
-```
-./bin/plsf [options] <input.nii>
-
-Options:
-  -d, --device  <mode>  CUDA device selector: gpu|default  [gpu]
-  -o, --output  <stem>  Write output files with the given stem
-  -p, --pairs           Compute persistence pairs via phat
-                        (default: output boundary matrix only)
-  -t, --timings         Report per-step wall time and memory usage
-  -v, --verbose         Print device info and grid statistics
-  -h, --help            Show this message and exit
-```
-
-Input must be an uncompressed NIfTI-1/2 file (`.nii`).
-
-### Output modes (require `-o <stem>`)
-
-| Flag | Files produced | Description |
-|---|---|---|
-| (none) | `<stem>.bin`, `<stem>.vals` | PHAT binary boundary matrix + filtration values |
-| `-p` | `<stem>.pairs`, `<stem>.vals` | Persistence pairs (PHAT binary) + filtration values |
