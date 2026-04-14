@@ -75,10 +75,15 @@ def print_table(
 
 
 def run_plsf_filtration(
-    nii_path: Path, plsf_bin: str, device: str, verbose: bool
+    nii_path: Path, plsf_bin: str, device: str, verbose: bool,
+    compress: bool = False, lossy: bool = False
 ) -> dict:
     """Run ``plsf -f -t`` and parse its table output."""
     cmd = [plsf_bin, str(nii_path), "-f", "-t", "-d", device]
+    if compress:
+        cmd.append("-x")
+    if lossy:
+        cmd.append("-l")
     if verbose:
         cmd.append("-v")
 
@@ -255,6 +260,25 @@ def main() -> None:
             "Default: %(default)s"
         ),
     )
+    plsf_flags = parser.add_mutually_exclusive_group()
+    plsf_flags.add_argument(
+        "-x", "--compress",
+        action="store_true",
+        help=(
+            "Pass -x to pLSF: use uint8_t filtration values instead of the "
+            "NIfTI native type to reduce GPU memory pressure. "
+            "Incompatible with --lossy."
+        ),
+    )
+    plsf_flags.add_argument(
+        "-l", "--lossy",
+        action="store_true",
+        help=(
+            "Pass -l to pLSF: encode cell dimension in the 2 LSBs of the "
+            "sortable float key, enabling a single-pass sort "
+            "(float/double only). Incompatible with --compress."
+        ),
+    )
     parser.add_argument(
         "--skip-plsf",
         action="store_true",
@@ -297,7 +321,8 @@ def main() -> None:
             sys.exit(1)
 
         info = run_plsf_filtration(
-            args.input, plsf_bin, args.device, args.verbose
+            args.input, plsf_bin, args.device, args.verbose,
+            compress=args.compress, lossy=args.lossy
         )
         if args.verbose:
             print(info["stdout"])
