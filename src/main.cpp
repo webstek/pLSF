@@ -185,7 +185,7 @@ static std::string fmt_mem (long kb)
     return "-";
   if (kb < 1024)
     return std::to_string (kb) + " KiB";
-  if (kb < 1024 * 1024)
+  if (kb < 10 * 1024 * 1024) // less than 10 GiB
     return std::to_string (kb / 1024) + " MiB";
   return std::to_string (kb / (1024 * 1024)) + " GiB";
 }
