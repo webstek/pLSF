@@ -101,6 +101,51 @@ def count_cells_from_shape(shape: tuple[int, ...]) -> int:
     return result
 
 
+def _parse_mem_mib(s: str) -> float:
+    """Parse a memory string like '366 MiB' or '2 GiB' into MiB.  Return 0 for '-'."""
+    s = s.strip()
+    if s == "-":
+        return 0.0
+    m = re.match(r"(\d+)\s*(KiB|MiB|GiB)", s)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    unit = m.group(2)
+    if unit == "KiB":
+        return val / 1024.0
+    if unit == "GiB":
+        return val * 1024.0
+    return val  # MiB
+
+
+def _get_current_rss_mib() -> float:
+    """Return current process RSS in MiB (Linux only)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_peak_rss_from_cmd(cmd: list[str]) -> float:
+    """Run a command under /usr/bin/time and return its peak RSS in MiB."""
+    try:
+        r = subprocess.run(
+            ["/usr/bin/time", "-v"] + cmd,
+            capture_output=True, text=True,
+        )
+        for line in r.stderr.splitlines():
+            if "Maximum resident set size" in line:
+                # Value is in KiB
+                return float(line.split()[-1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
 # ── pLSF filtration-only timing ─────────────────────────────────────────────
 
 
@@ -122,16 +167,36 @@ def run_plsf_filtration(
         raise RuntimeError(f"plsf failed (exit {result.returncode}):\n{result.stderr}")
 
     timings: dict[str, float] = {}
+    host_rss: dict[str, float] = {}
+    dev_peak: dict[str, float] = {}
     for line in result.stdout.splitlines():
-        m = re.match(r"^(\S[\w\s]+?)\s{2,}([\d.]+)\s*ms", line)
+        m = re.match(
+            r"^(\S[\w\s]+?)\s{2,}([\d.]+)\s*ms"
+            r"\s+(\d+\s*(?:KiB|MiB|GiB)|-)"
+            r"\s+(\d+\s*(?:KiB|MiB|GiB)|-)",
+            line,
+        )
         if m:
             label = m.group(1).strip()
             timings[label] = float(m.group(2))
+            host_rss[label] = _parse_mem_mib(m.group(3))
+            dev_peak[label] = _parse_mem_mib(m.group(4))
+        else:
+            m2 = re.match(r"^(\S[\w\s]+?)\s{2,}([\d.]+)\s*ms", line)
+            if m2:
+                label = m2.group(1).strip()
+                timings[label] = float(m2.group(2))
+
+    # Take max across all steps for peak values
+    peak_host_mib = max(host_rss.values(), default=0.0)
+    peak_dev_mib = max(dev_peak.values(), default=0.0)
 
     return {
         "load_ms": timings.get("NIfTI load", 0.0),
         "enum_ms": timings.get("Complex computation", 0.0),
         "sort_ms": timings.get("Complex sorting", 0.0),
+        "peak_host_mib": peak_host_mib,
+        "peak_dev_mib": peak_dev_mib,
         "stdout": result.stdout,
     }
 
@@ -162,6 +227,9 @@ def run_cr_filtration(
         raise RuntimeError(
             f"cubicalripser failed (exit {result.returncode}):\n{result.stderr}"
         )
+
+    # Measure peak RSS via /proc on Linux
+    peak_host_mib = _get_peak_rss_from_cmd(cmd)
 
     load_ms = 0.0
     total_enum_ms = 0.0
@@ -195,6 +263,7 @@ def run_cr_filtration(
         "enum_ms": total_enum_ms,
         "sort_ms": total_sort_ms,
         "dim_timings": dim_timings,
+        "peak_host_mib": peak_host_mib,
         "stdout": result.stdout,
     }
 
@@ -211,6 +280,8 @@ def run_gudhi_filtration(data, verbose: bool) -> dict:
     """
     import gudhi as gd
 
+    rss_before = _get_current_rss_mib()
+
     t0 = time.perf_counter()
     cc = gd.CubicalComplex(top_dimensional_cells=data)
     construct_ms = (time.perf_counter() - t0) * 1000.0
@@ -218,6 +289,9 @@ def run_gudhi_filtration(data, verbose: bool) -> dict:
     t1 = time.perf_counter()
     cc.persistence(homology_coeff_field=2, min_persistence=0)
     persistence_ms = (time.perf_counter() - t1) * 1000.0
+
+    rss_after = _get_current_rss_mib()
+    peak_host_mib = max(rss_after - rss_before, 0.0)
 
     total_ms = construct_ms + persistence_ms
 
@@ -230,6 +304,7 @@ def run_gudhi_filtration(data, verbose: bool) -> dict:
         "construct_ms": construct_ms,
         "persistence_ms": persistence_ms,
         "total_ms": total_ms,
+        "peak_host_mib": peak_host_mib,
     }
 
 
@@ -292,6 +367,7 @@ def run_dipha_filtration(
     load_ms = 0.0
     filtration_ms = 0.0
     cells = 0
+    peak_mem_mib = 0.0
 
     for line in result.stdout.splitlines():
         if not line.startswith("TIMING:"):
@@ -305,6 +381,8 @@ def run_dipha_filtration(
             filtration_ms = float(tokens["filtration_ms"])
         if "cells" in tokens:
             cells = int(tokens["cells"])
+        if "peak_mem_mib" in tokens:
+            peak_mem_mib = float(tokens["peak_mem_mib"])
 
     if verbose:
         print(result.stdout)
@@ -313,6 +391,7 @@ def run_dipha_filtration(
         "load_ms": load_ms,
         "filtration_ms": filtration_ms,
         "cells": cells,
+        "peak_host_mib": peak_mem_mib,
         "stdout": result.stdout,
     }
 
@@ -320,66 +399,156 @@ def run_dipha_filtration(
 # ── Plotting ─────────────────────────────────────────────────────────────────
 
 
+def _probe_hardware() -> dict:
+    """Return a dict with CPU and GPU info strings for the hardware summary."""
+    import subprocess
+
+    cpu_name = "Unknown CPU"
+    cpu_cores = "?"
+    try:
+        lscpu = subprocess.run(["lscpu"], capture_output=True, text=True).stdout
+        for line in lscpu.splitlines():
+            k, _, v = line.partition(":")
+            k, v = k.strip(), v.strip()
+            if k == "Model name":
+                cpu_name = v
+            elif k == "CPU(s)" and cpu_cores == "?":
+                cpu_cores = v
+    except Exception:
+        pass
+
+    gpu_name = "Unknown GPU"
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True,
+        ).stdout.strip().splitlines()
+        if out and out[0]:
+            gpu_name = out[0]
+    except Exception:
+        pass
+
+    return {"cpu_name": cpu_name, "cpu_cores": cpu_cores, "gpu_name": gpu_name}
+
+
 def make_plot(
     results: list[dict],
     output_path: Path,
+    dipha_nodes: int = 1,
 ) -> None:
-    """Plot filtration time (including file load) vs number of cells.
+    """Plot filtration time and peak memory vs number of voxels (side by side).
 
     ``results`` is a list of dicts with keys:
-        "file", "num_cells",
-        "plsf_total_ms", "cr_total_ms", "gudhi_total_ms", "dipha_total_ms"
+        "file", "num_voxels", "num_cells",
+        "plsf_total_ms", "cr_total_ms", "gudhi_total_ms", "dipha_total_ms",
+        "plsf_host_mib", "plsf_dev_mib", "cr_host_mib", "gudhi_host_mib",
+        "dipha_host_mib"
     (any may be None if skipped or failed).
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # Sort by cell count
-    results = sorted(results, key=lambda r: r["num_cells"])
+    results = sorted(results, key=lambda r: r["num_voxels"])
+    voxels = [r["num_voxels"] for r in results]
 
-    cells = [r["num_cells"] for r in results]
-    labels = [Path(r["file"]).name for r in results]
+    hw = _probe_hardware()
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    tool_keys = [
-        ("plsf_total_ms", "pLSF (GPU)", "tab:blue", "o"),
-        ("cr_total_ms", "Cubical Ripser", "tab:orange", "s"),
-        ("gudhi_total_ms", "GUDHI", "tab:green", "^"),
-        ("dipha_total_ms", "DIPHA", "tab:red", "D"),
+    # ── Tool style definitions ───────────────────────────────────────────
+    # (time_key, mem_key, legend_label, linestyle, marker)
+    tool_styles = [
+        ("plsf_total_ms",  "plsf_host_mib",  "pLSF (host)",    "-",  "o"),
+        (None,              "plsf_dev_mib",   "pLSF (device)",  "-",  "x"),
+        ("cr_total_ms",    "cr_host_mib",     "Cubical Ripser", "--", "s"),
+        ("gudhi_total_ms", "gudhi_host_mib",  "GUDHI",          "-.", "^"),
+        ("dipha_total_ms", "dipha_host_mib",  "DIPHA",          ":",  "D"),
     ]
 
-    for key, label, color, marker in tool_keys:
+    fig, (ax_time, ax_mem) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # ── Left panel: timing ───────────────────────────────────────────────
+    for time_key, _mem_key, label, ls, marker in tool_styles:
+        if time_key is None:
+            continue
         xs, ys = [], []
-        for r, c in zip(results, cells):
-            val = r.get(key)
+        for r, v in zip(results, voxels):
+            val = r.get(time_key)
             if val is not None:
-                xs.append(c)
-                ys.append(val / 1000.0)  # convert ms → seconds
+                xs.append(v)
+                ys.append(val / 1000.0)
         if xs:
-            ax.plot(xs, ys, marker=marker, color=color, label=label, linewidth=2, markersize=8)
+            ax_time.plot(xs, ys, linestyle=ls, marker=marker, color="black",
+                         label=label, linewidth=1.5, markersize=7)
 
-    ax.set_xlabel("Number of elementary cubes in cubical complex")
-    ax.set_ylabel("Total filtration time (s)  [includes file load]")
-    ax.set_title("Filtration Time vs Number of Elementary Cubes")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax_time.set_xlabel("Number of voxels")
+    ax_time.set_ylabel("Total filtration time (s)  [includes file load]")
+    ax_time.set_title("Filtration Time")
+    ax_time.legend(fontsize=8)
+    ax_time.grid(True, alpha=0.3)
 
-    if len(cells) > 1 and max(cells) / max(min(cells), 1) > 10:
-        ax.set_xscale("log")
-    if any(r.get(k) for r in results for k, *_ in tool_keys):
-        ys_all = [
-            r.get(k) / 1000.0
-            for r in results
-            for k, *_ in tool_keys
-            if r.get(k) is not None
-        ]
-        if ys_all and max(ys_all) / max(min(ys_all), 1e-9) > 10:
-            ax.set_yscale("log")
+    if len(voxels) > 1 and max(voxels) / max(min(voxels), 1) > 10:
+        ax_time.set_xscale("log")
+    ys_all = [
+        r.get(k) / 1000.0
+        for r in results
+        for k, *_ in tool_styles
+        if k is not None and r.get(k) is not None
+    ]
+    if ys_all and max(ys_all) / max(min(ys_all), 1e-9) > 10:
+        ax_time.set_yscale("log")
+
+    # ── Right panel: peak memory ─────────────────────────────────────────
+    for _time_key, mem_key, label, ls, marker in tool_styles:
+        xs, ys = [], []
+        for r, v in zip(results, voxels):
+            val = r.get(mem_key)
+            if val is not None and val > 0:
+                xs.append(v)
+                ys.append(val)
+        if xs:
+            ax_mem.plot(xs, ys, linestyle=ls, marker=marker, color="black",
+                        label=label, linewidth=1.5, markersize=7)
+
+    ax_mem.set_xlabel("Number of voxels")
+    ax_mem.set_ylabel("Peak memory (MiB)")
+    ax_mem.set_title("Peak Memory Usage")
+    ax_mem.legend(fontsize=8)
+    ax_mem.grid(True, alpha=0.3)
+
+    if len(voxels) > 1 and max(voxels) / max(min(voxels), 1) > 10:
+        ax_mem.set_xscale("log")
+    mem_all = [
+        r.get(mk)
+        for r in results
+        for _, mk, *_ in tool_styles
+        if r.get(mk) is not None and r.get(mk) > 0
+    ]
+    if mem_all and max(mem_all) / max(min(mem_all), 1e-9) > 10:
+        ax_mem.set_yscale("log")
+
+    # ── Hardware summary ─────────────────────────────────────────────────
+    dipha_hw = f"DIPHA          \u2014 {hw['cpu_name']}, {hw['cpu_cores']} cores"
+    if dipha_nodes > 1:
+        dipha_hw += f", {dipha_nodes} MPI processes"
+    hw_lines = [
+        f"pLSF           \u2014 {hw['gpu_name']} (CUDA)",
+        f"Cubical Ripser \u2014 {hw['cpu_name']}, {hw['cpu_cores']} cores",
+        f"GUDHI          \u2014 {hw['cpu_name']}, {hw['cpu_cores']} cores",
+        dipha_hw,
+    ]
+    hw_text = "Hardware:  " + hw_lines[0]
+    for line in hw_lines[1:]:
+        hw_text += "\n           " + line
+    fig.text(
+        0.5, -0.02, hw_text,
+        ha="center", va="top",
+        fontsize=7.5,
+        fontfamily="monospace",
+        transform=fig.transFigure,
+    )
 
     fig.tight_layout()
-    fig.savefig(str(output_path), dpi=150)
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
     print(f"Plot saved to {output_path}")
     plt.close(fig)
 
@@ -415,6 +584,12 @@ def benchmark_one_file(nii_path: Path, args) -> dict:
         "cr_total_ms": None,
         "gudhi_total_ms": None,
         "dipha_total_ms": None,
+        # Memory (MiB) — None means skipped/failed
+        "plsf_host_mib": None,
+        "plsf_dev_mib": None,
+        "cr_host_mib": None,
+        "gudhi_host_mib": None,
+        "dipha_host_mib": None,
     }
 
     # ── pLSF ─────────────────────────────────────────────────────────────
@@ -437,6 +612,8 @@ def benchmark_one_file(nii_path: Path, args) -> dict:
                 plsf_filt_ms = info["load_ms"] + info["enum_ms"] + info["sort_ms"]
                 rows.append(("Total (load + filt)", "pLSF", fmt_time(plsf_filt_ms)))
                 result["plsf_total_ms"] = plsf_filt_ms
+                result["plsf_host_mib"] = info["peak_host_mib"]
+                result["plsf_dev_mib"] = info["peak_dev_mib"]
             except Exception as e:
                 print(f"  [ERROR] pLSF: {e}", file=sys.stderr)
 
@@ -475,6 +652,7 @@ def benchmark_one_file(nii_path: Path, args) -> dict:
                     cr_filt_ms = conv_ms + cr["load_ms"] + cr["enum_ms"] + cr["sort_ms"]
                     rows.append(("Total (conv + load + filt)", "CubicalRipser", fmt_time(cr_filt_ms)))
                     result["cr_total_ms"] = cr_filt_ms
+                    result["cr_host_mib"] = cr["peak_host_mib"]
             except Exception as e:
                 print(f"  [ERROR] CubicalRipser: {e}", file=sys.stderr)
 
@@ -494,6 +672,7 @@ def benchmark_one_file(nii_path: Path, args) -> dict:
                 gudhi_total = load_ms_shared + gudhi_info["total_ms"]
                 rows.append(("Total (load + filt)", "GUDHI", fmt_time(gudhi_total)))
                 result["gudhi_total_ms"] = gudhi_total
+                result["gudhi_host_mib"] = gudhi_info["peak_host_mib"]
             except Exception as e:
                 print(f"  [ERROR] GUDHI: {e}", file=sys.stderr)
 
@@ -521,6 +700,7 @@ def benchmark_one_file(nii_path: Path, args) -> dict:
                     dipha_total = conv_ms + dipha_info["load_ms"] + dipha_info["filtration_ms"]
                     rows.append(("Total (conv + load + filt)", "DIPHA", fmt_time(dipha_total)))
                     result["dipha_total_ms"] = dipha_total
+                    result["dipha_host_mib"] = dipha_info["peak_host_mib"]
             except Exception as e:
                 print(f"  [ERROR] DIPHA: {e}", file=sys.stderr)
 
@@ -717,7 +897,7 @@ def main() -> None:
     # Generate plot
     if args.plot:
         try:
-            make_plot(all_results, args.plot)
+            make_plot(all_results, args.plot, dipha_nodes=args.dipha_nodes)
         except Exception as e:
             print(f"Error generating plot: {e}", file=sys.stderr)
 
