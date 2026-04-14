@@ -351,7 +351,7 @@ def run_dipha_filtration(
     with tempfile.NamedTemporaryFile(suffix=".out", delete=False) as f:
         dummy_out = f.name
 
-    cmd = ["mpirun", "--allow-run-as-root", "-n", str(nprocs),
+    cmd = ["mpirun", "-n", str(nprocs),
            dipha_bin, "--filtration-only", str(complex_path), dummy_out]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
