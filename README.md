@@ -57,6 +57,56 @@ make release          # release build (explicit)
 make debug            # build with debug symbols
 make clean            # remove build artifacts
 make run              # build and run with default settings
+make info             # print resolved build configuration
 make CUDA_ARCH=sm_XX  # target a specific GPU architecture
-make help             # prints build configuration
+make help             # prints available targets and variables
+```
+
+The host boundary-matrix step uses **OpenMP** automatically when `g++` is present; no extra flags are required.
+
+### CubicalRipser (benchmark dependency)
+
+The benchmark script requires the `cubicalripser` binary, built from the
+`lib/CubicalRipser` submodule:
+
+```bash
+cmake -S lib/CubicalRipser -B lib/CubicalRipser/build
+cmake --build lib/CubicalRipser/build
+```
+
+The compiled binary will be placed at `lib/CubicalRipser/build/cubicalripser`.
+
+## Benchmark
+
+`examples/benchmark.py` compares the filtration construction and sorting
+phases of pLSF (GPU) against Cubical Ripser (CPU) on a 3-D NIfTI volume.
+Neither pipeline performs persistent-homology reduction; only the complex
+enumeration and sort times are measured.
+
+**Python dependencies:** `pip install nibabel numpy`
+
+```
+python examples/benchmark.py <input.nii> [options]
+
+Options:
+  --plsf PATH           Path to plsf binary         [bin/plsf]
+  --cubicalripser PATH   Path to cubicalripser binary [lib/CubicalRipser/build/cubicalripser]
+  --device {gpu,default} CUDA device selector for plsf [gpu]
+  --maxdim N            Max cell dimension for Cubical Ripser [3]
+  --skip-plsf           Run Cubical Ripser only
+  --skip-cripser        Run pLSF only
+  -v, --verbose         Print raw subprocess output
+```
+
+Sample data files are provided in `examples/data/`.
+
+```bash
+# compare both pipelines on the bundled 1 mm atlas
+python examples/benchmark.py examples/data/full_cls_1000um_2009b_sym.nii
+
+# pLSF only (no CUDA Ripser needed)
+python examples/benchmark.py examples/data/full_cls_1000um_2009b_sym.nii --skip-cripser
+
+# use CUDA default device selector and show per-step output
+python examples/benchmark.py examples/data/full_cls_1000um_2009b_sym.nii --device default -v
 ```

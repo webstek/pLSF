@@ -1,3 +1,6 @@
 [submodule "lib/phat"]
 	path = lib/phat
 	url = https://github.com/blazs/phat
+[submodule "lib/CubicalRipser"]
+	path = lib/CubicalRipser
+	url = https://github.com/webstek/CubicalRipser.git

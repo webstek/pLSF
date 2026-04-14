@@ -3,5 +3,11 @@
 *.out
 .clang-format
 .vscode
+.venv
 build
 bin
+
+# CubicalRipser build artifacts
+lib/CubicalRipser/build/*
+!lib/CubicalRipser/build/.gitkeep
+lib/CubicalRipser/build/pybind11/
